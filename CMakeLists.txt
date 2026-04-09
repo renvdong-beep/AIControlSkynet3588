@@ -63,6 +63,7 @@ add_executable(rknn_optimized
 
 # H.264/H.265 解码测试
 add_executable(h264_decode_test
+    src/h264_decode_test_main.cpp
     src/decoder/mpp_decoder.cpp
 )
 
@@ -109,7 +110,7 @@ if(Qt5_FOUND)
     # 简化版测试程序（模拟数据）
     add_executable(simple_qt_test src/qt_ui/simple_test.cpp)
     target_include_directories(simple_qt_test PRIVATE ${COMMON_INCLUDES})
-    target_link_libraries(simple_qt_test PRIVATE ${QT_LIBS} pthread)
+    target_link_libraries(simple_qt_test PRIVATE ${QT_LIBS} ${COMMON_LIBS})
     
     # 单路真实摄像头测试程序
     add_executable(real_camera_test src/qt_ui/real_camera_test.cpp)
@@ -150,6 +151,11 @@ if(Qt5_FOUND)
             add_executable(multi_rtsp_mpp_test src/qt_ui/multi_rtsp_mpp_test.cpp)
             target_include_directories(multi_rtsp_mpp_test PRIVATE ${COMMON_INCLUDES} ${FFMPEG_INCLUDE_DIRS})
             target_link_libraries(multi_rtsp_mpp_test PRIVATE ${QT_LIBS} ${COMMON_LIBS} ${FFMPEG_LIBRARIES})
+
+            # ========== Multi-RTSP Benchmark ==========
+            add_executable(multi_rtsp_benchmark src/multi_rtsp_benchmark.cpp)
+            target_include_directories(multi_rtsp_benchmark PRIVATE ${COMMON_INCLUDES} ${FFMPEG_INCLUDE_DIRS})
+            target_link_libraries(multi_rtsp_benchmark PRIVATE ${COMMON_LIBS} ${FFMPEG_LIBRARIES})
             
             message(STATUS "FFmpeg found, building ffmpeg_video_test, rtsp_test, rtsp_video_test, multi_rtsp_test, multi_rtsp_mpp_test")
         else()
@@ -188,3 +194,4 @@ if(PkgConfig_FOUND)
         message(STATUS "Added mpp_rtsp_cli_test target")
     endif()
 endif()
+
