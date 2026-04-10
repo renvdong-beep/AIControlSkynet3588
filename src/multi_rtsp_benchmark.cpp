@@ -32,6 +32,7 @@
 #include <numeric>
 #include <functional>
 
+
 extern "C" {
 #include <libavformat/avformat.h>
 }
@@ -48,68 +49,10 @@ extern "C" {
 #include <rknn_api.h>
 
 static std::atomic<bool> g_running{true};
+static void signal_handler(int sig) { g_running = false; }
 static int64_t get_time_ms() { struct timeval tv; gettimeofday(&tv, NULL); return (int64_t)tv.tv_sec*1000 + tv.tv_usec/1000; }
 
 // ============================================================================
-
-// ========== Multi-channel Benchmark Extensions ==========
-#define MODEL_PATH "/home/topeet/rknpu2/examples/rknn_yolov5_demo/model/RK3588/yolov5s-640-640_rk3588.rknn"
-#define MAX_CHANNELS 4
-#define BENCH_DURATION 60
-
-static const char* DEFAULT_RTSP_URLS[MAX_CHANNELS] = {
-    "rtsp://192.168.137.251:8554/cow0",
-    "rtsp://192.168.137.251:8554/cow1",
-    "rtsp://192.168.137.251:8554/cow2",
-    "rtsp://192.168.137.251:8554/cow3"
-};
-
-// Per-channel stats
-struct ChannelStats {
-    int channel_id = 0;
-    std::atomic<int> decode_count{0};
-    std::atomic<int> infer_count{0};
-    std::atomic<int> detect_count{0};
-    double decode_ms_sum = 0;
-    double infer_ms_sum = 0;
-    double e2e_ms_sum = 0;
-    std::mutex sum_mutex;
-    std::vector<double> infer_latencies;
-    std::mutex latency_mutex;
-    rknn_core_mask core_mask = RKNN_NPU_CORE_AUTO;
-    
-    void addDecodeMs(double ms) { std::lock_guard<std::mutex> lk(sum_mutex); decode_ms_sum += ms; }
-    void addInferMs(double ms) { std::lock_guard<std::mutex> lk(sum_mutex); infer_ms_sum += ms; }
-    void addE2EMs(double ms) { std::lock_guard<std::mutex> lk(sum_mutex); e2e_ms_sum += ms; }
-    void addInferLatency(double ms) {
-        std::lock_guard<std::mutex> lk(latency_mutex);
-        infer_latencies.push_back(ms);
-        if (infer_latencies.size() > 10000) infer_latencies.erase(infer_latencies.begin(), infer_latencies.begin() + 1000);
-    }
-    double inferAvg() const {
-        std::lock_guard<std::mutex> lk(const_cast<std::mutex&>(latency_mutex));
-        if (infer_latencies.empty()) return 0;
-        return std::accumulate(infer_latencies.begin(), infer_latencies.end(), 0.0) / infer_latencies.size();
-    }
-    double inferP99() const {
-        std::lock_guard<std::mutex> lk(const_cast<std::mutex&>(latency_mutex));
-        if (infer_latencies.empty()) return 0;
-        auto v = infer_latencies;
-        std::sort(v.begin(), v.end());
-        return v[(int)(v.size() * 0.99)];
-    }
-    double inferMin() const {
-        std::lock_guard<std::mutex> lk(const_cast<std::mutex&>(latency_mutex));
-        if (infer_latencies.empty()) return 0;
-        return *std::min_element(infer_latencies.begin(), infer_latencies.end());
-    }
-    double inferMax() const {
-        std::lock_guard<std::mutex> lk(const_cast<std::mutex&>(latency_mutex));
-        if (infer_latencies.empty()) return 0;
-        return *std::max_element(infer_latencies.begin(), infer_latencies.end());
-    }
-};
-
 // YOLOv5 Post-process (2-class model)
 // ============================================================================
 #define OBJ_CLASS_NUM 2
@@ -221,7 +164,6 @@ static void nms(std::vector<float> &boxes, std::vector<int> &classId,
 // ============================================================================
 // MPP H.264 Decoder (legacy API)
 // ============================================================================
-
 class MPPH264Decoder {
 public:
     MPPH264Decoder(int id=0) : id_(id), ctx_(nullptr), api_(nullptr),
@@ -284,8 +226,7 @@ public:
         return true;
     }
 
-    typedef std::function<void(const uint8_t* nv12, int w, int h, int hs, int vs)> FrameCallback;
-    int drain_frames(FrameCallback cb = nullptr) {
+    int drain_frames() {
         int got = 0;
         while (true) {
             MppFrame frame = nullptr;
@@ -307,7 +248,6 @@ public:
                 if (frame_count_ <= 5 || frame_count_ % 100 == 0)
                     printf("[MPP#%d] Frame #%d, %dx%d (stride %d:%d)\n", id_, frame_count_, width_, height_, hor_stride_, ver_stride_);
                 got++;
-                if (cb) cb(last_frame_buf_, width_, height_, hor_stride_, ver_stride_);
             }
             mpp_frame_deinit(&frame);
         }
@@ -350,7 +290,6 @@ private:
 };
 
 // ============================================================================
-
 // RKNN Inference (correct YOLOv5 2-class post-process)
 // ============================================================================
 class RKNNInference {
@@ -524,121 +463,182 @@ private:
 // Main
 // ============================================================================
 
+// ============================================================================
+// Multi-channel Benchmark
+// ============================================================================
+#define MAX_CHANNELS 4
+#define BENCH_DURATION 60
 
-// ========== Multi-channel Benchmark ==========
+static const char* DEFAULT_RTSP_URLS[MAX_CHANNELS] = {
+    "rtsp://192.168.137.251:8554/cow0",
+    "rtsp://192.168.137.251:8554/cow1",
+    "rtsp://192.168.137.251:8554/cow2",
+    "rtsp://192.168.137.251:8554/cow3"
+};
+static const char* MODEL_PATH = "/home/topeet/rknpu2/examples/rknn_yolov5_demo/install/rknn_yolov5_demo_Linux/model/RK3588/yolov5s-640-640_rk3588.rknn";
+
+struct ChannelStats {
+    int ch;
+    std::atomic<int> video_pkts{0};
+    std::atomic<int> decoded{0};
+    std::atomic<int> inferred{0};
+    std::atomic<int> detections{0};
+    double infer_ms_sum = 0;
+    double e2e_ms_sum = 0;
+    std::mutex sum_mutex;
+    std::vector<double> infer_latencies;
+    std::mutex lat_mutex;
+    rknn_core_mask core;
+
+    void addInferMs(double ms) { std::lock_guard<std::mutex> lk(sum_mutex); infer_ms_sum += ms; }
+    void addE2EMs(double ms) { std::lock_guard<std::mutex> lk(sum_mutex); e2e_ms_sum += ms; }
+    void addLatency(double ms) {
+        std::lock_guard<std::mutex> lk(lat_mutex);
+        infer_latencies.push_back(ms);
+    }
+    double avgInfer() const {
+        std::lock_guard<std::mutex> lk(const_cast<std::mutex&>(lat_mutex));
+        if (infer_latencies.empty()) return 0;
+        return std::accumulate(infer_latencies.begin(), infer_latencies.end(), 0.0) / infer_latencies.size();
+    }
+    double p99Infer() const {
+        std::lock_guard<std::mutex> lk(const_cast<std::mutex&>(lat_mutex));
+        if (infer_latencies.empty()) return 0;
+        auto v = infer_latencies;
+        std::sort(v.begin(), v.end());
+        return v[(int)(v.size() * 0.99)];
+    }
+    double minInfer() const {
+        std::lock_guard<std::mutex> lk(const_cast<std::mutex&>(lat_mutex));
+        if (infer_latencies.empty()) return 0;
+        return *std::min_element(infer_latencies.begin(), infer_latencies.end());
+    }
+    double maxInfer() const {
+        std::lock_guard<std::mutex> lk(const_cast<std::mutex&>(lat_mutex));
+        if (infer_latencies.empty()) return 0;
+        return *std::max_element(infer_latencies.begin(), infer_latencies.end());
+    }
+};
+
 static std::atomic<bool> g_bench_running{false};
-static ChannelStats* g_stats[MAX_CHANNELS] = {nullptr};
 
-void channel_loop(int ch, const char* rtsp_url, RKNNInference* rknn, int duration_sec) {
-    ChannelStats& stats = *g_stats[ch];
+void channel_loop(int ch, const char* rtsp_url, RKNNInference* rknn, ChannelStats* stats, int duration_sec) {
     printf("[CH%d] Starting, RTSP: %s\n", ch, rtsp_url);
-    
+
     MPPH264Decoder decoder(ch);
     if (!decoder.init()) { printf("[CH%d] MPP init failed\n", ch); return; }
-    
+
     avformat_network_init();
     AVFormatContext* fmt_ctx = nullptr;
-    AVDictionary* opts = nullptr;
-    av_dict_set(&opts, "rtsp_transport", "tcp", 0);
-    av_dict_set(&opts, "stimeout", "5000000", 0);
-    av_dict_set(&opts, "fflags", "nobuffer", 0);
-    av_dict_set(&opts, "max_delay", "500000", 0);
-    
-    if (avformat_open_input(&fmt_ctx, rtsp_url, nullptr, &opts) < 0) {
+
+    auto connect_rtsp = [&]() -> bool {
+        if (fmt_ctx) avformat_close_input(&fmt_ctx);
+        fmt_ctx = nullptr;
+        AVDictionary* opts = nullptr;
+        av_dict_set(&opts, "rtsp_transport", "tcp", 0);
+        av_dict_set(&opts, "stimeout", "5000000", 0);
+        av_dict_set(&opts, "fflags", "nobuffer", 0);
+        int r = avformat_open_input(&fmt_ctx, rtsp_url, nullptr, &opts);
         av_dict_free(&opts);
-        printf("[CH%d] Failed to open RTSP\n", ch); return;
-    }
-    av_dict_free(&opts);
-    
-    int video_stream = -1;
-    for (unsigned i = 0; i < fmt_ctx->nb_streams; i++)
-        if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) { video_stream = (int)i; break; }
-    if (video_stream < 0) { avformat_close_input(&fmt_ctx); return; }
-    
-    AVStream* vst = fmt_ctx->streams[video_stream];
-    printf("[CH%d] Video: %dx%d, codec=%d\n", ch, vst->codecpar->width, vst->codecpar->height, vst->codecpar->codec_id);
-    
+        if (r < 0) { fmt_ctx = nullptr; return false; }
+        return true;
+    };
+
+    auto find_video = [&]() -> int {
+        if (!fmt_ctx) return -1;
+        for (unsigned i = 0; i < fmt_ctx->nb_streams; i++)
+            if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) return (int)i;
+        return -1;
+    };
+
+    if (!connect_rtsp()) { printf("[CH%d] RTSP connect failed\n", ch); return; }
+    int video_stream = find_video();
+    if (video_stream < 0) { printf("[CH%d] No video stream\n", ch); return; }
+
     // Send extradata
-    if (vst->codecpar->extradata && vst->codecpar->extradata_size > 0) {
-        int sz = vst->codecpar->extradata_size;
-        uint8_t* ed = vst->codecpar->extradata;
-        bool is_annexb = (sz >= 4 && ed[0]==0 && ed[1]==0 && ed[2]==0 && ed[3]==1);
-        if (is_annexb) { decoder.send_packet(ed, sz, false); }
-        else {
-            int pos = 6;
-            while (pos + 2 < sz) {
-                int nl = (ed[pos]<<8)|ed[pos+1]; pos += 2;
-                if (pos + nl > sz) break;
-                std::vector<uint8_t> sc(4+nl); sc[0]=0;sc[1]=0;sc[2]=0;sc[3]=1;
-                memcpy(sc.data()+4, &ed[pos], nl);
-                decoder.send_packet(sc.data(), sc.size(), false);
-                pos += nl;
+    {
+        AVStream* vst = fmt_ctx->streams[video_stream];
+        if (vst->codecpar->extradata && vst->codecpar->extradata_size > 0) {
+            int sz = vst->codecpar->extradata_size;
+            uint8_t* ed = vst->codecpar->extradata;
+            bool is_annexb = (sz >= 4 && ed[0]==0 && ed[1]==0 && ed[2]==0 && ed[3]==1);
+            if (is_annexb) { decoder.send_packet(ed, sz, false); }
+            else {
+                int pos = 6;
+                while (pos + 2 < sz) {
+                    int nl = (ed[pos]<<8)|ed[pos+1]; pos += 2;
+                    if (pos + nl > sz) break;
+                    std::vector<uint8_t> sc(4+nl); sc[0]=0;sc[1]=0;sc[2]=0;sc[3]=1;
+                    memcpy(sc.data()+4, &ed[pos], nl);
+                    decoder.send_packet(sc.data(), sc.size(), false);
+                    pos += nl;
+                }
             }
         }
     }
-    
+
     AVPacket* pkt = av_packet_alloc();
     int64_t start_time = get_time_ms();
-    
+
     while (g_bench_running && (get_time_ms() - start_time) < duration_sec * 1000) {
-        int ret = av_read_frame(fmt_ctx, pkt);
-        if (ret < 0) {
-            printf("[CH%d] RTSP read failed, reconnecting...\n", ch);
-            avformat_close_input(&fmt_ctx); fmt_ctx = nullptr;
-            AVDictionary* opts2 = nullptr;
-            av_dict_set(&opts2, "rtsp_transport", "tcp", 0);
-            av_dict_set(&opts2, "stimeout", "5000000", 0);
-            if (avformat_open_input(&fmt_ctx, rtsp_url, nullptr, &opts2) < 0) {
-                av_dict_free(&opts2);
-                std::this_thread::sleep_for(std::chrono::seconds(2));
-                continue;
-            }
-            av_dict_free(&opts2);
-            video_stream = -1;
-            for (unsigned i = 0; i < fmt_ctx->nb_streams; i++)
-                if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) { video_stream = (int)i; break; }
+        if (!fmt_ctx) {
+            if (!connect_rtsp()) { std::this_thread::sleep_for(std::chrono::seconds(2)); continue; }
+            video_stream = find_video();
             if (video_stream < 0) { avformat_close_input(&fmt_ctx); fmt_ctx = nullptr; continue; }
-            vst = fmt_ctx->streams[video_stream];
+            AVStream* vst = fmt_ctx->streams[video_stream];
             if (vst->codecpar->extradata && vst->codecpar->extradata_size > 0)
                 decoder.send_packet(vst->codecpar->extradata, vst->codecpar->extradata_size, false);
             continue;
         }
-        
+
+        int ret = av_read_frame(fmt_ctx, pkt);
+        if (ret < 0) {
+            printf("[CH%d] RTSP read failed, reconnecting...\n", ch);
+            avformat_close_input(&fmt_ctx); fmt_ctx = nullptr; continue;
+        }
         if (pkt->stream_index != video_stream) { av_packet_unref(pkt); continue; }
+
+        stats->video_pkts.fetch_add(1);
         bool is_keyframe = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
-        
-        auto t_decode_start = std::chrono::steady_clock::now();
+
+        auto t0 = std::chrono::steady_clock::now();
         decoder.send_packet(pkt->data, pkt->size, is_keyframe);
-        
-        decoder.drain_frames([&](const uint8_t* nv12, int w, int h, int hs, int vs) {
-            auto t_decode_end = std::chrono::steady_clock::now();
-            double decode_ms = std::chrono::duration<double, std::milli>(t_decode_end - t_decode_start).count();
-            stats.decode_count.fetch_add(1);
-            stats.addDecodeMs(decode_ms);
-            
-            auto t_infer_start = std::chrono::steady_clock::now();
+        int got = decoder.drain_frames();
+        stats->decoded.fetch_add(got);
+
+        // Infer on every decoded frame (not every 10th like the test)
+        if (got > 0 && decoder.get_last_frame()) {
+            auto t1 = std::chrono::steady_clock::now();
             std::vector<detect_result_t> results;
-            int det_count = rknn->infer_nv12(nv12, w, h, hs, vs, results);
-            auto t_infer_end = std::chrono::steady_clock::now();
-            
-            double infer_ms = std::chrono::duration<double, std::milli>(t_infer_end - t_infer_start).count();
-            double e2e_ms = std::chrono::duration<double, std::milli>(t_infer_end - t_decode_start).count();
-            
-            stats.infer_count.fetch_add(1);
-            stats.addInferMs(infer_ms);
-            stats.addE2EMs(e2e_ms);
-            stats.detect_count.fetch_add(det_count);
-            stats.addInferLatency(infer_ms);
-        });
+            int nd = rknn->infer_nv12(decoder.get_last_frame(),
+                                       decoder.get_width(), decoder.get_height(),
+                                       decoder.get_hor_stride(), decoder.get_ver_stride(), results);
+            auto t2 = std::chrono::steady_clock::now();
+
+            double infer_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+            double e2e_ms = std::chrono::duration<double, std::milli>(t2 - t0).count();
+
+            stats->inferred.fetch_add(1);
+            stats->detections.fetch_add(nd);
+            stats->addInferMs(infer_ms);
+            stats->addE2EMs(e2e_ms);
+            stats->addLatency(infer_ms);
+        }
         av_packet_unref(pkt);
     }
-    
+
     av_packet_free(&pkt);
-    avformat_close_input(&fmt_ctx);
-    printf("[CH%d] Loop ended. Decoded: %d, Inferred: %d\n", ch, stats.decode_count.load(), stats.infer_count.load());
+    if (fmt_ctx) avformat_close_input(&fmt_ctx);
+    printf("[CH%d] Done. Video=%d Decoded=%d Inferred=%d Detections=%d\n",
+           ch, stats->video_pkts.load(), stats->decoded.load(),
+           stats->inferred.load(), stats->detections.load());
 }
 
 int main(int argc, char* argv[]) {
+    setbuf(stdout, NULL); setbuf(stderr, NULL);
+    signal(SIGINT, [](int){ g_bench_running = false; });
+    signal(SIGTERM, [](int){ g_bench_running = false; });
+
     int num_channels = 4, duration_sec = BENCH_DURATION;
     if (argc >= 2) num_channels = atoi(argv[1]);
     if (argc >= 3) duration_sec = atoi(argv[2]);
@@ -646,7 +646,7 @@ int main(int argc, char* argv[]) {
         printf("Usage: %s [channels 1-%d] [duration_seconds]\n", argv[0], MAX_CHANNELS);
         return 1;
     }
-    
+
     printf("\n========================================================\n");
     printf("  Multi-RTSP + MPP + RKNN Performance Benchmark\n");
     printf("========================================================\n");
@@ -654,104 +654,93 @@ int main(int argc, char* argv[]) {
     printf("  Model:    %s\n", MODEL_PATH);
     printf("  BOX_THRESH: %.2f  NMS_THRESH: %.2f\n", BOX_THRESH, NMS_THRESH);
     printf("========================================================\n\n");
-    
-    signal(SIGINT, [](int){ g_bench_running = false; });
+
     g_bench_running = true;
-    
-    // Init RKNN instances
-    rknn_core_mask core_masks[] = { RKNN_NPU_CORE_0, RKNN_NPU_CORE_1, RKNN_NPU_CORE_2 };
+
+    // Init RKNN per channel
+    rknn_core_mask cores[] = { RKNN_NPU_CORE_0, RKNN_NPU_CORE_1, RKNN_NPU_CORE_2 };
     RKNNInference rknn[MAX_CHANNELS];
     for (int i = 0; i < num_channels; i++) {
-        rknn_core_mask core = core_masks[i % 3];
-        if (!rknn[i].init(std::string(MODEL_PATH), core)) {
+        rknn_core_mask core = cores[i % 3];
+        if (!rknn[i].init(MODEL_PATH, core)) {
             printf("[FATAL] RKNN#%d init failed\n", i); return 1;
         }
-        printf("[RKNN#%d] Initialized, core=%d, outputs=3\n", i, (int)core);
     }
-    
+
     // Init stats
     ChannelStats stats[MAX_CHANNELS];
     for (int i = 0; i < num_channels; i++) {
-        stats[i].channel_id = i;
-        stats[i].core_mask = core_masks[i % 3];
-        g_stats[i] = &stats[i];
+        stats[i].ch = i;
+        stats[i].core = cores[i % 3];
     }
-    
-    // Launch channel threads
+
+    // Launch threads
     std::vector<std::thread> threads;
     for (int i = 0; i < num_channels; i++)
-        threads.emplace_back(channel_loop, i, DEFAULT_RTSP_URLS[i], &rknn[i], duration_sec);
-    
-    // Live stats every 5 seconds
+        threads.emplace_back(channel_loop, i, DEFAULT_RTSP_URLS[i], &rknn[i], &stats[i], duration_sec);
+
+    // Live stats every 5s
     int64_t start_time = get_time_ms();
     while (g_bench_running && (get_time_ms() - start_time) < duration_sec * 1000) {
-        int elapsed = (get_time_ms() - start_time) / 1000;
-        if (elapsed > 0 && elapsed % 5 == 0) {
-            int next_report = (elapsed / 5 + 1) * 5;
-            while (g_bench_running && (get_time_ms() - start_time) / 1000 < next_report && (get_time_ms() - start_time) < duration_sec * 1000)
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            if (!g_bench_running) break;
-            int sec = (get_time_ms() - start_time) / 1000;
-            printf("\n--- [%ds] Live Stats ---\n", sec);
-            for (int i = 0; i < num_channels; i++) {
-                double fps = sec > 0 ? (double)stats[i].infer_count / sec : 0;
-                printf("  CH%d: %d frames, %.1f fps, avg_infer=%.1fms, detections=%d\n",
-                    i, stats[i].infer_count.load(), fps, stats[i].inferAvg(), stats[i].detect_count.load());
-            }
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        if (!g_bench_running) break;
+        int sec = (get_time_ms() - start_time) / 1000;
+        printf("\n--- [%ds] Live Stats ---\n", sec);
+        for (int i = 0; i < num_channels; i++) {
+            double fps = sec > 0 ? (double)stats[i].inferred / sec : 0;
+            printf("  CH%d: %d inferred, %.1f fps, avg_infer=%.1fms, detections=%d\n",
+                i, stats[i].inferred.load(), fps, stats[i].avgInfer(), stats[i].detections.load());
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
-    
+
     g_bench_running = false;
     for (auto& t : threads) t.join();
-    
-    // Print results
-    int total_sec = duration_sec;
+
+    // Final report
     int total_infer = 0, total_detect = 0;
-    for (int i = 0; i < num_channels; i++) { total_infer += stats[i].infer_count; total_detect += stats[i].detect_count; }
-    double total_fps = total_sec > 0 ? (double)total_infer / total_sec : 0;
-    
+    for (int i = 0; i < num_channels; i++) { total_infer += stats[i].inferred; total_detect += stats[i].detections; }
+
     printf("\n========================================================\n");
-    printf("  BENCHMARK RESULTS SUMMARY\n");
+    printf("  BENCHMARK RESULTS\n");
     printf("========================================================\n");
-    printf("  Channels: %d  |  Duration: %ds  |  Model: YOLOv5s\n", num_channels, total_sec);
-    printf("  BOX_THRESH: %.2f  |  NMS_THRESH: %.2f\n", BOX_THRESH, NMS_THRESH);
+    printf("  Channels: %d  |  Duration: %ds  |  Total Inferred: %d\n", num_channels, duration_sec, total_infer);
     printf("========================================================\n\n");
-    
-    printf("Channel | NPU Core | Frames |   FPS  | Avg Infer | P99 Infer | Min Infer | Max Infer | Detections\n");
-    printf("--------|----------|--------|--------|-----------|-----------|-----------|-----------|----------\n");
+
+    printf("Channel | NPU Core | Video | Decoded | Inferred |   FPS  | Avg Infer | P99 Infer | Min | Max | Detections\n");
+    printf("--------|----------|-------|---------|----------|--------|-----------|-----------|-----|-----|----------\n");
     for (int i = 0; i < num_channels; i++) {
-        double fps = total_sec > 0 ? (double)stats[i].infer_count / total_sec : 0;
-        printf("  CH%d   |  Core %d  | %6d | %6.1f |  %6.2fms |  %6.2fms |  %6.2fms |  %6.2fms | %8d\n",
-            i, (int)stats[i].core_mask, stats[i].infer_count.load(), fps,
-            stats[i].inferAvg(), stats[i].inferP99(), stats[i].inferMin(), stats[i].inferMax(),
-            stats[i].detect_count.load());
+        double fps = duration_sec > 0 ? (double)stats[i].inferred / duration_sec : 0;
+        printf("  CH%d   |  Core %d  | %5d | %7d | %8d | %6.1f |  %6.2fms |  %6.2fms | %4.0f | %4.0f | %8d\n",
+            i, (int)stats[i].core, stats[i].video_pkts.load(), stats[i].decoded.load(),
+            stats[i].inferred.load(), fps, stats[i].avgInfer(), stats[i].p99Infer(),
+            stats[i].minInfer(), stats[i].maxInfer(), stats[i].detections.load());
     }
-    printf("--------|----------|--------|--------|-----------|-----------|-----------|-----------|----------\n");
-    printf("  TOTAL |    -     | %6d | %6.1f |     -     |     -     |     -     |     -     | %8d\n", total_infer, total_detect);
-    
+    printf("--------|----------|-------|---------|----------|--------|-----------|-----------|-----|-----|----------\n");
+    printf("  TOTAL |    -     |     - |       - | %8d | %6.1f |     -     |     -     |   - |   - | %8d\n",
+        total_infer, duration_sec > 0 ? (double)total_infer / duration_sec : 0, total_detect);
+
     // NPU load
     printf("\n--- NPU Load ---\n");
     FILE* npu_fp = fopen("/sys/kernel/debug/rknpu/load", "r");
     if (npu_fp) { char buf[256]; while (fgets(buf, sizeof(buf), npu_fp)) printf("  %s", buf); fclose(npu_fp); }
-    
-    // CSV export
+
+    // CSV
     char csv_name[128];
-    snprintf(csv_name, sizeof(csv_name), "benchmark_%dch_%ds.csv", num_channels, total_sec);
+    snprintf(csv_name, sizeof(csv_name), "benchmark_%dch_%ds.csv", num_channels, duration_sec);
     FILE* csv = fopen(csv_name, "w");
     if (csv) {
-        fprintf(csv, "channel,npu_core,frames,fps,avg_infer_ms,p99_infer_ms,min_infer_ms,max_infer_ms,detections\n");
+        fprintf(csv, "channel,npu_core,video,decoded,inferred,fps,avg_infer_ms,p99_infer_ms,min_infer_ms,max_infer_ms,detections\n");
         for (int i = 0; i < num_channels; i++) {
-            double fps = total_sec > 0 ? (double)stats[i].infer_count / total_sec : 0;
-            fprintf(csv, "%d,%d,%d,%.1f,%.2f,%.2f,%.2f,%.2f,%d\n",
-                i, (int)stats[i].core_mask, stats[i].infer_count.load(), fps,
-                stats[i].inferAvg(), stats[i].inferP99(), stats[i].inferMin(), stats[i].inferMax(),
-                stats[i].detect_count.load());
+            double fps = duration_sec > 0 ? (double)stats[i].inferred / duration_sec : 0;
+            fprintf(csv, "%d,%d,%d,%d,%d,%.1f,%.2f,%.2f,%.2f,%.2f,%d\n",
+                i, (int)stats[i].core, stats[i].video_pkts.load(), stats[i].decoded.load(),
+                stats[i].inferred.load(), fps, stats[i].avgInfer(), stats[i].p99Infer(),
+                stats[i].minInfer(), stats[i].maxInfer(), stats[i].detections.load());
         }
         fclose(csv);
         printf("\nResults saved to: %s\n", csv_name);
     }
-    
+
     printf("\nBenchmark complete.\n");
     return 0;
 }

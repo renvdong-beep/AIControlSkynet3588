@@ -50,6 +50,7 @@
 #include <chrono>
 #include <algorithm>
 #include <numeric>
+#include <functional>
 #include <string>
 #include <map>
 #include <fstream>
@@ -74,7 +75,7 @@ extern "C" {
 #include <rknn_api.h>
 
 // ========== 配置 ==========
-#define MODEL_PATH "/home/topeet/rknpu2/examples/rknn_yolov5_demo/model/RK3588/yolov5s-640-640.rknn"
+#define MODEL_PATH "/home/topeet/rknpu2/examples/rknn_yolov5_demo/model/RK3588/yolov5s-640-640_rk3588.rknn"
 #define MODEL_INPUT_SIZE 640
 #define OBJ_CLASS_NUM 2
 #define BOX_THRESH 0.50
@@ -232,49 +233,131 @@ static void nms(std::vector<float> &boxes, std::vector<int> &classId,
 }
 
 // ========== MPP 解码器 ==========
-class MppH264Decoder {
+class MPPH264Decoder {
 public:
-    MppH264Decoder() : ctx_(nullptr), api_(nullptr), got_info_(false), frame_count_(0) {}
-    
+    MPPH264Decoder(int id=0) : id_(id), ctx_(nullptr), api_(nullptr),
+        frm_grp_(nullptr), initialized_(false), width_(0), height_(0),
+        hor_stride_(0), ver_stride_(0), got_keyframe_(false),
+        send_count_(0), frame_count_(0), info_change_done_(false),
+        last_frame_buf_(nullptr), last_frame_size_(0) {}
+
+    ~MPPH264Decoder() {
+        if (frm_grp_) mpp_buffer_group_put(frm_grp_);
+        if (ctx_) mpp_destroy(ctx_);
+    }
+
     bool init() {
-        if (mpp_create(&ctx_, &api_) != MPP_OK) return false;
-        if (mpp_init(ctx_, MPP_CTX_DEC, MPP_VIDEO_CodingAVC) != MPP_OK) { mpp_destroy(ctx_); ctx_ = nullptr; return false; }
+        MPP_RET ret = mpp_create(&ctx_, &api_);
+        if (ret != MPP_OK) return false;
+        MppParam param = nullptr;
+        api_->control(ctx_, MPP_DEC_SET_PARSER_SPLIT_MODE, &param);
+        ret = mpp_init(ctx_, MPP_CTX_DEC, MPP_VIDEO_CodingAVC);
+        if (ret != MPP_OK) return false;
+        initialized_ = true;
+        printf("[MPP#%d] H.264 decoder initialized\n", id_);
         return true;
     }
-    
-    bool sendPacket(uint8_t *data, size_t size) {
-        MppPacket pkt = nullptr;
-        mpp_packet_init(&pkt, data, size);
-        MPP_RET ret = api_->decode_put_packet(ctx_, pkt);
-        mpp_packet_deinit(&pkt);
-        return ret == MPP_OK;
-    }
-    
-    bool getFrame(MppFrame *frame) {
-        MPP_RET ret = api_->decode_get_frame(ctx_, frame);
-        if (ret == MPP_OK && *frame) {
-            if (!got_info_) {
-                MppBufferGroup grp = nullptr;
-                mpp_buffer_group_get_internal(&grp, MPP_BUFFER_TYPE_ION);
-                api_->control(ctx_, MPP_DEC_SET_EXT_BUF_GROUP, grp);
-                mpp_buffer_group_limit_config(grp, 24, 12);
-                api_->control(ctx_, MPP_DEC_SET_INFO_CHANGE_READY, NULL);
-                got_info_ = true;
+
+    bool send_packet(const uint8_t* data, size_t size, bool is_keyframe = false) {
+        if (!initialized_ || !data || size == 0) return false;
+        int nalu_type = -1;
+        for (size_t i = 0; i + 4 < size; i++) {
+            if (data[i]==0 && data[i+1]==0 && data[i+2]==0 && data[i+3]==1) {
+                nalu_type = data[i+4] & 0x1F; break;
             }
-            frame_count_++;
-            return true;
         }
-        return false;
+        bool is_config = (nalu_type == 7 || nalu_type == 8) && !is_keyframe;
+        if (is_keyframe) { got_keyframe_ = true; printf("[MPP#%d] 关键帧 NALU=%d size=%zu\n", id_, nalu_type, size); }
+        if (!got_keyframe_ && !is_config) return false;
+
+        void* pkt_data = malloc(size);
+        if (!pkt_data) return false;
+        memcpy(pkt_data, data, size);
+        MppPacket packet = nullptr;
+        MPP_RET ret = mpp_packet_init(&packet, pkt_data, size);
+        if (ret != MPP_OK) { free(pkt_data); return false; }
+        mpp_packet_set_length(packet, size);
+        ret = api_->decode_put_packet(ctx_, packet);
+        mpp_packet_deinit(&packet);
+        if (ret == -1012) {
+            drain_frames();
+            void* rdata = malloc(size); if (!rdata) return false;
+            memcpy(rdata, data, size);
+            MppPacket rpkt = nullptr;
+            ret = mpp_packet_init(&rpkt, rdata, size);
+            if (ret != MPP_OK) { free(rdata); return false; }
+            mpp_packet_set_length(rpkt, size);
+            ret = api_->decode_put_packet(ctx_, rpkt);
+            mpp_packet_deinit(&rpkt);
+            if (ret != MPP_OK) return false;
+        } else if (ret != MPP_OK) { return false; }
+        send_count_++;
+        return true;
     }
-    
-    void close() { if (ctx_) { mpp_destroy(ctx_); ctx_ = nullptr; } }
-    int frameCount() const { return frame_count_; }
+
+    typedef std::function<void(const uint8_t* nv12, int w, int h, int hs, int vs)> FrameCallback;
+    int drain_frames(FrameCallback cb = nullptr) {
+        int got = 0;
+        while (true) {
+            MppFrame frame = nullptr;
+            MPP_RET ret = api_->decode_get_frame(ctx_, &frame);
+            if (ret != MPP_OK || !frame) break;
+            if (mpp_frame_get_info_change(frame)) { handle_info_change(frame); mpp_frame_deinit(&frame); continue; }
+            MppBuffer frm_buf = mpp_frame_get_buffer(frame);
+            if (frm_buf) {
+                width_ = mpp_frame_get_width(frame);
+                height_ = mpp_frame_get_height(frame);
+                hor_stride_ = mpp_frame_get_hor_stride(frame);
+                ver_stride_ = mpp_frame_get_ver_stride(frame);
+                size_t buf_size = mpp_buffer_get_size(frm_buf);
+                uint8_t* src = (uint8_t*)mpp_buffer_get_ptr(frm_buf);
+                if (buf_size > last_frame_size_) { last_frame_data_.resize(buf_size); last_frame_size_ = buf_size; }
+                memcpy(last_frame_data_.data(), src, buf_size);
+                last_frame_buf_ = last_frame_data_.data();
+                frame_count_++;
+                if (frame_count_ <= 5 || frame_count_ % 100 == 0)
+                    printf("[MPP#%d] Frame #%d, %dx%d (stride %d:%d)\n", id_, frame_count_, width_, height_, hor_stride_, ver_stride_);
+                got++;
+                if (cb) cb(last_frame_buf_, width_, height_, hor_stride_, ver_stride_);
+            }
+            mpp_frame_deinit(&frame);
+        }
+        return got;
+    }
+
+    uint8_t* get_last_frame() const { return last_frame_buf_; }
+    uint32_t get_width() const { return width_; }
+    uint32_t get_height() const { return height_; }
+    uint32_t get_hor_stride() const { return hor_stride_; }
+    uint32_t get_ver_stride() const { return ver_stride_; }
+    int get_frame_count() const { return frame_count_; }
+    int get_send_count() const { return send_count_; }
 
 private:
-    MppCtx ctx_;
-    MppApi *api_;
-    bool got_info_;
-    int frame_count_;
+    void handle_info_change(MppFrame frame) {
+        uint32_t w = mpp_frame_get_width(frame), h = mpp_frame_get_height(frame);
+        uint32_t hs = mpp_frame_get_hor_stride(frame), vs = mpp_frame_get_ver_stride(frame);
+        uint32_t bs = mpp_frame_get_buf_size(frame);
+        printf("[MPP#%d] Info change: %dx%d, stride [%d:%d], buf_size=%d\n", id_, w, h, hs, vs, bs);
+        if (info_change_done_) { api_->control(ctx_, MPP_DEC_SET_INFO_CHANGE_READY, NULL); return; }
+        MppBufferGroup grp = nullptr;
+        MPP_RET ret = mpp_buffer_group_get_internal(&grp, MPP_BUFFER_TYPE_ION);
+        if (ret != MPP_OK) ret = mpp_buffer_group_get_internal(&grp, MPP_BUFFER_TYPE_DMA_HEAP);
+        if (ret != MPP_OK) return;
+        for (int i = 0; i < 24; i++) { MppBuffer fb; mpp_buffer_get(grp, &fb, bs); }
+        ret = api_->control(ctx_, MPP_DEC_SET_EXT_BUF_GROUP, grp);
+        if (ret != MPP_OK) { mpp_buffer_group_put(grp); return; }
+        frm_grp_ = grp;
+        api_->control(ctx_, MPP_DEC_SET_INFO_CHANGE_READY, NULL);
+        info_change_done_ = true;
+        width_ = w; height_ = h; hor_stride_ = hs; ver_stride_ = vs;
+        printf("[MPP#%d] Info change handled\n", id_);
+    }
+
+    int id_; MppCtx ctx_; MppApi* api_; MppBufferGroup frm_grp_;
+    bool initialized_; uint32_t width_, height_, hor_stride_, ver_stride_;
+    bool got_keyframe_; int send_count_, frame_count_; bool info_change_done_;
+    std::vector<uint8_t> last_frame_data_; uint8_t* last_frame_buf_; size_t last_frame_size_;
 };
 
 // ========== RKNN 推理器 ==========
@@ -373,6 +456,21 @@ public:
         
         rknn_outputs_release(ctx_, n_output_, outputs);
         return (int)results.size();
+    }
+    int infer_nv12(const uint8_t* nv12_data, int src_w, int src_h, int hor_stride, int ver_stride,
+                   std::vector<detect_result_t> &results) {
+        if (!initialized_) return -1;
+        
+        // RGA: NV12 -> RGB888 640x640
+        uint8_t *rgb_buf = (uint8_t*)malloc(MODEL_INPUT_SIZE * MODEL_INPUT_SIZE * 3);
+        rga_buffer_t src_img = wrapbuffer_virtualaddr((void*)nv12_data, src_w, src_h, RK_FORMAT_YCbCr_420_SP, hor_stride, ver_stride);
+        rga_buffer_t dst_img = wrapbuffer_virtualaddr(rgb_buf, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, RK_FORMAT_BGR_888);
+        IM_STATUS st = imresize(src_img, dst_img);
+        if (st != IM_STATUS_SUCCESS) { free(rgb_buf); return 0; }
+        
+        int ret = infer(rgb_buf, src_w, src_h, results);
+        free(rgb_buf);
+        return ret >= 0 ? results.size() : ret;
     }
     
     ~RKNNInferencer() { if (initialized_) rknn_destroy(ctx_); }
@@ -712,85 +810,79 @@ private:
         AVCodecParameters *codecpar = fmt_ctx->streams[video_idx]->codecpar;
         log(QString("CH%1: %2x%3, codec=%4").arg(ch).arg(codecpar->width).arg(codecpar->height).arg(codecpar->codec_id));
         
-        MppH264Decoder decoder;
+        MPPH264Decoder decoder(ch);
         if (!decoder.init()) { avformat_close_input(&fmt_ctx); return; }
         
-        if (codecpar->extradata_size > 0)
-            decoder.sendPacket(codecpar->extradata, codecpar->extradata_size);
+        // Send extradata (SPS/PPS)
+        if (codecpar->extradata && codecpar->extradata_size > 0) {
+            int sz = codecpar->extradata_size;
+            uint8_t* ed = codecpar->extradata;
+            bool is_annexb = (sz >= 4 && ed[0]==0 && ed[1]==0 && ed[2]==0 && ed[3]==1);
+            if (is_annexb) {
+                decoder.send_packet(ed, sz, false);
+            } else {
+                int pos = 6;
+                while (pos + 2 < sz) {
+                    int nl = (ed[pos]<<8)|ed[pos+1]; pos += 2;
+                    if (pos + nl > sz) break;
+                    std::vector<uint8_t> sc(4+nl); sc[0]=0;sc[1]=0;sc[2]=0;sc[3]=1;
+                    memcpy(sc.data()+4, &ed[pos], nl);
+                    decoder.send_packet(sc.data(), sc.size(), false);
+                    pos += nl;
+                }
+            }
+        }
         
-        uint8_t *rgb_buf = (uint8_t*)malloc(MODEL_INPUT_SIZE * MODEL_INPUT_SIZE * 3);
-        bool got_keyframe = false;
         AVPacket *avpkt = av_packet_alloc();
-        
-        // 用于显示的帧数据
-        int src_w = codecpar->width;
-        int src_h = codecpar->height;
-        uint8_t *display_rgb = (uint8_t*)malloc(src_w * src_h * 3);
+        int display_counter = 0;
         
         while (running_ && av_read_frame(fmt_ctx, avpkt) >= 0) {
             if (avpkt->stream_index != video_idx) { av_packet_unref(avpkt); continue; }
             
             bool is_keyframe = (avpkt->flags & AV_PKT_FLAG_KEY) != 0;
-            if (!got_keyframe && !is_keyframe) { av_packet_unref(avpkt); continue; }
-            if (is_keyframe) got_keyframe = true;
-            
             auto t_decode_start = std::chrono::steady_clock::now();
-            decoder.sendPacket(avpkt->data, avpkt->size);
+            decoder.send_packet(avpkt->data, avpkt->size, is_keyframe);
             
-            MppFrame frame = nullptr;
-            while (decoder.getFrame(&frame) && frame) {
-                int w = mpp_frame_get_width(frame);
-                int h = mpp_frame_get_height(frame);
-                MppBuffer buf = mpp_frame_get_buffer(frame);
+            decoder.drain_frames([&](const uint8_t* nv12, int w, int h, int hs, int vs) {
+                auto t_decode_end = std::chrono::steady_clock::now();
+                double decode_ms = std::chrono::duration<double, std::milli>(t_decode_end - t_decode_start).count();
+                stats_(ch).decode_count++;
+                stats_(ch).addDecodeMs(decode_ms);
                 
-                if (buf) {
-                    auto t_decode_end = std::chrono::steady_clock::now();
-                    double decode_ms = std::chrono::duration<double, std::milli>(t_decode_end - t_decode_start).count();
-                    stats_(ch).decode_count++;
-                    stats_(ch).addDecodeMs(decode_ms);
-                    
-                    // RGA: NV12 → RGB888 640x640 (for RKNN)
-                    rga_buffer_t src_img = wrapbuffer_fd(mpp_buffer_get_fd(buf), w, h, RK_FORMAT_YCbCr_420_SP);
-                    rga_buffer_t dst_img = wrapbuffer_virtualaddr(rgb_buf, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, RK_FORMAT_BGR_888);
-                    
-                    if (imresize(src_img, dst_img) == IM_STATUS_SUCCESS) {
-                        auto t_infer_start = std::chrono::steady_clock::now();
-                        std::vector<detect_result_t> results;
-                        int det_count = rknn_[ch].infer(rgb_buf, w, h, results);
-                        auto t_infer_end = std::chrono::steady_clock::now();
-                        
-                        double infer_ms = std::chrono::duration<double, std::milli>(t_infer_end - t_infer_start).count();
-                        double e2e_ms = std::chrono::duration<double, std::milli>(t_infer_end - t_decode_start).count();
-                        
-                        stats_(ch).infer_count++;
-                        stats_(ch).addInferMs(infer_ms);
-                        stats_(ch).addE2EMs(e2e_ms);
-                        stats_(ch).detect_count += det_count;
-                        stats_(ch).addInferLatency(infer_ms);
-                        stats_(ch).addE2ELatency(e2e_ms);
-                        
-                        // 生成显示帧（低频更新）
-                        {
-                            std::lock_guard<std::mutex> lock(display_mutex_[ch]);
-                            // RGA: NV12 → RGB888 原始尺寸（用于显示）
-                            rga_buffer_t disp_src = wrapbuffer_fd(mpp_buffer_get_fd(buf), w, h, RK_FORMAT_YCbCr_420_SP);
-                            rga_buffer_t disp_dst = wrapbuffer_virtualaddr(display_rgb, w, h, RK_FORMAT_BGR_888);
-                            if (imcvtcolor(disp_src, disp_dst, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_BGR_888) == IM_STATUS_SUCCESS) {
-                                display_image_[ch] = QImage(display_rgb, w, h, w * 3, QImage::Format_RGB888).copy();
-                                display_results_[ch] = results;
-                            }
-                        }
+                // RKNN inference
+                auto t_infer_start = std::chrono::steady_clock::now();
+                std::vector<detect_result_t> results;
+                int det_count = rknn_[ch].infer_nv12(nv12, w, h, hs, vs, results);
+                auto t_infer_end = std::chrono::steady_clock::now();
+                
+                double infer_ms = std::chrono::duration<double, std::milli>(t_infer_end - t_infer_start).count();
+                double e2e_ms = std::chrono::duration<double, std::milli>(t_infer_end - t_decode_start).count();
+                
+                stats_(ch).infer_count++;
+                stats_(ch).addInferMs(infer_ms);
+                stats_(ch).addE2EMs(e2e_ms);
+                stats_(ch).detect_count += det_count;
+                stats_(ch).addInferLatency(infer_ms);
+                stats_(ch).addE2ELatency(e2e_ms);
+                
+                // Update display frame (every 5th frame)
+                display_counter++;
+                if (display_counter % 5 == 0) {
+                    std::lock_guard<std::mutex> lock(display_mutex_[ch]);
+                    uint8_t *display_rgb = (uint8_t*)malloc(w * h * 3);
+                    rga_buffer_t disp_src = wrapbuffer_virtualaddr((void*)nv12, hs, vs, RK_FORMAT_YCbCr_420_SP, hs, vs);
+                    rga_buffer_t disp_dst = wrapbuffer_virtualaddr(display_rgb, w, h, RK_FORMAT_BGR_888);
+                    if (imcvtcolor(disp_src, disp_dst, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_BGR_888) == IM_STATUS_SUCCESS) {
+                        display_image_[ch] = QImage(display_rgb, h, w, w * 3, QImage::Format_RGB888).copy();
+                        display_results_[ch] = results;
                     }
+                    free(display_rgb);
                 }
-                mpp_frame_deinit(&frame);
-            }
+            });
             av_packet_unref(avpkt);
         }
         
         av_packet_free(&avpkt);
-        free(rgb_buf);
-        free(display_rgb);
-        decoder.close();
         avformat_close_input(&fmt_ctx);
         log(QString("CH%1 loop ended. Decoded: %2, Inferred: %3")
             .arg(ch).arg(stats_(ch).decode_count.load()).arg(stats_(ch).infer_count.load()));
