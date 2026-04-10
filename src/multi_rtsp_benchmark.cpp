@@ -1,123 +1,132 @@
 /**
- * @file multi_rtsp_benchmark.cpp
- * @brief 多路 RTSP + MPP 硬解 + RKNN 推理性能基准测试
+ * @file mpp_rtsp_cli_test.cpp
+ * @brief MPP+RGA+RKNN RTSP CLI Test v5
  * 
- * 对比 RTSP_PERFORMANCE_ANALYSIS.md 中的数据，精确测量：
- * - 1/2/3/4 路 RTSP 各自的解码+推理 FPS
- * - NPU 各核心利用率
- * - CPU 占用率
- * - 推理延迟分布（min/max/avg/p99）
- * - 解码延迟
- * - 端到端延迟
+ * 关键修复：
+ * - 模型是 2 类 YOLOv5（不是 80 类 COCO）
+ * - 输出格式: [1, 21, 80, 80] NHWC，21 = 3*(5+2)
+ * - 使用 int8 量化输出 + 反量化
+ * - 正确的 YOLOv5 后处理（anchor-based grid decode + NMS）
  * 
- * 无 GUI，纯命令行输出，方便自动化测试。
- * 
- * 使用方法：
- *   ./multi_rtsp_benchmark [路数] [持续时间秒]
- *   ./multi_rtsp_benchmark 4 60    # 4路测试60秒
- *   ./multi_rtsp_benchmark 1 30    # 1路测试30秒
+ * 编译：cd build && make mpp_rtsp_cli_test -j4
+ * 运行：./mpp_rtsp_cli_test [rtsp_url] [duration_seconds]
  */
 
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <cmath>
-#include <vector>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <signal.h>
+#include <unistd.h>
+#include <sys/time.h>
+#include <math.h>
+
 #include <thread>
 #include <atomic>
-#include <mutex>
-#include <chrono>
-#include <algorithm>
-#include <numeric>
+#include <vector>
 #include <string>
-#include <map>
-#include <fstream>
-#include <sstream>
+#include <chrono>
 #include <set>
+#include <algorithm>
+#include <mutex>
+#include <numeric>
+#include <functional>
 
 extern "C" {
 #include <libavformat/avformat.h>
-#include <libavcodec/avcodec.h>
 }
 
 #include <rockchip/rk_mpi.h>
 #include <rockchip/mpp_buffer.h>
 #include <rockchip/mpp_frame.h>
-#include <rockchip/mpp_meta.h>
+#include <rockchip/mpp_packet.h>
 #include <rockchip/rk_vdec_cmd.h>
 
+#include <rga/im2d.hpp>
 #include <rga/RgaApi.h>
-#include <rga/im2d.h>
-#include <rga/drmrga.h>
 
 #include <rknn_api.h>
 
-// ========== 配置 ==========
-#define MODEL_PATH "/home/topeet/rknpu2/examples/rknn_yolov5_demo/model/RK3588/yolov5s-640-640.rknn"
-#define MODEL_INPUT_SIZE 640
-#define OBJ_CLASS_NUM 2
-#define BOX_THRESH 0.50
-#define NMS_THRESH 0.45
-#define MAX_CHANNELS 4
+static std::atomic<bool> g_running{true};
+static int64_t get_time_ms() { struct timeval tv; gettimeofday(&tv, NULL); return (int64_t)tv.tv_sec*1000 + tv.tv_usec/1000; }
 
-static const char* CLASS_NAMES[OBJ_CLASS_NUM] = {"cow", "person"};
-static const char* RTSP_URLS[MAX_CHANNELS] = {
+// ============================================================================
+
+// ========== Multi-channel Benchmark Extensions ==========
+#define MODEL_PATH "/home/topeet/rknpu2/examples/rknn_yolov5_demo/model/RK3588/yolov5s-640-640_rk3588.rknn"
+#define MAX_CHANNELS 4
+#define BENCH_DURATION 60
+
+static const char* DEFAULT_RTSP_URLS[MAX_CHANNELS] = {
     "rtsp://192.168.137.251:8554/cow0",
     "rtsp://192.168.137.251:8554/cow1",
     "rtsp://192.168.137.251:8554/cow2",
     "rtsp://192.168.137.251:8554/cow3"
 };
 
-// YOLOv5 anchors
-static const int anchor0[6] = {10, 13, 16, 30, 33, 23};
-static const int anchor1[6] = {30, 61, 62, 45, 59, 119};
-static const int anchor2[6] = {116, 90, 156, 198, 373, 326};
-
-// ========== 数据结构 ==========
-typedef struct {
-    int left, right, top, bottom;
-    float prop;
-    int class_id;
-} detect_result_t;
-
-// 单通道性能统计
+// Per-channel stats
 struct ChannelStats {
-    int channel_id;
-    int decode_count = 0;
-    int infer_count = 0;
-    int detect_count = 0;
+    int channel_id = 0;
+    std::atomic<int> decode_count{0};
+    std::atomic<int> infer_count{0};
+    std::atomic<int> detect_count{0};
     double decode_ms_sum = 0;
     double infer_ms_sum = 0;
     double e2e_ms_sum = 0;
+    std::mutex sum_mutex;
     std::vector<double> infer_latencies;
-    std::vector<double> e2e_latencies;
-    rknn_core_mask core_mask;
+    std::mutex latency_mutex;
+    rknn_core_mask core_mask = RKNN_NPU_CORE_AUTO;
     
+    void addDecodeMs(double ms) { std::lock_guard<std::mutex> lk(sum_mutex); decode_ms_sum += ms; }
+    void addInferMs(double ms) { std::lock_guard<std::mutex> lk(sum_mutex); infer_ms_sum += ms; }
+    void addE2EMs(double ms) { std::lock_guard<std::mutex> lk(sum_mutex); e2e_ms_sum += ms; }
+    void addInferLatency(double ms) {
+        std::lock_guard<std::mutex> lk(latency_mutex);
+        infer_latencies.push_back(ms);
+        if (infer_latencies.size() > 10000) infer_latencies.erase(infer_latencies.begin(), infer_latencies.begin() + 1000);
+    }
     double inferAvg() const {
+        std::lock_guard<std::mutex> lk(const_cast<std::mutex&>(latency_mutex));
         if (infer_latencies.empty()) return 0;
         return std::accumulate(infer_latencies.begin(), infer_latencies.end(), 0.0) / infer_latencies.size();
     }
     double inferP99() const {
+        std::lock_guard<std::mutex> lk(const_cast<std::mutex&>(latency_mutex));
         if (infer_latencies.empty()) return 0;
         auto v = infer_latencies;
         std::sort(v.begin(), v.end());
         return v[(int)(v.size() * 0.99)];
     }
     double inferMin() const {
+        std::lock_guard<std::mutex> lk(const_cast<std::mutex&>(latency_mutex));
         if (infer_latencies.empty()) return 0;
         return *std::min_element(infer_latencies.begin(), infer_latencies.end());
     }
     double inferMax() const {
+        std::lock_guard<std::mutex> lk(const_cast<std::mutex&>(latency_mutex));
         if (infer_latencies.empty()) return 0;
         return *std::max_element(infer_latencies.begin(), infer_latencies.end());
     }
-    double e2eAvg() const {
-        if (e2e_latencies.empty()) return 0;
-        return std::accumulate(e2e_latencies.begin(), e2e_latencies.end(), 0.0) / e2e_latencies.size();
-    }
 };
 
-// ========== 工具函数 ==========
+// YOLOv5 Post-process (2-class model)
+// ============================================================================
+#define OBJ_CLASS_NUM 2
+#define PROP_BOX_SIZE (5 + OBJ_CLASS_NUM)  // 7
+#define NMS_THRESH 0.45f
+#define BOX_THRESH 0.25f
+
+const int anchor0[6] = {10, 13, 16, 30, 33, 23};
+const int anchor1[6] = {30, 61, 62, 45, 59, 119};
+const int anchor2[6] = {116, 90, 156, 198, 373, 326};
+
+typedef struct {
+    int left, right, top, bottom;
+    float prop;
+    int class_id;
+} detect_result_t;
+
 static inline int clamp_i(float val, int min, int max) {
     return val > min ? (val < max ? (int)val : max) : min;
 }
@@ -126,470 +135,623 @@ static float deqnt_affine_to_f32(int8_t qnt, int32_t zp, float scale) {
     return ((float)qnt - (float)zp) * scale;
 }
 
-static int process_feature(int8_t *data, int *anchor, int grid_h, int grid_w,
-                           int height, int width, int stride,
+static int8_t qnt_f32_to_affine(float f32, int32_t zp, float scale) {
+    float dst_val = (f32 / scale) + zp;
+    int val = (int)dst_val;
+    if (val > 127) val = 127;
+    if (val < -128) val = -128;
+    return (int8_t)val;
+}
+
+static int process_feature(int8_t *input, int *anchor, int grid_h, int grid_w,
+                           int model_h, int model_w, int stride,
                            std::vector<float> &boxes, std::vector<float> &objProbs,
                            std::vector<int> &classId, float threshold,
                            int32_t zp, float scale) {
     int validCount = 0;
-    for (int h = 0; h < grid_h; h++) {
-        for (int w = 0; w < grid_w; w++) {
-            for (int a = 0; a < 3; a++) {
-                int channel = a * (5 + OBJ_CLASS_NUM);
-                float box_conf = deqnt_affine_to_f32(data[(channel + 4) * grid_h * grid_w + h * grid_w + w], zp, scale);
-                if (box_conf < threshold) continue;
-                
-                float box_x = deqnt_affine_to_f32(data[(channel + 0) * grid_h * grid_w + h * grid_w + w], zp, scale);
-                float box_y = deqnt_affine_to_f32(data[(channel + 1) * grid_h * grid_w + h * grid_w + w], zp, scale);
-                float box_w = deqnt_affine_to_f32(data[(channel + 2) * grid_h * grid_w + h * grid_w + w], zp, scale);
-                float box_h = deqnt_affine_to_f32(data[(channel + 3) * grid_h * grid_w + h * grid_w + w], zp, scale);
-                
-                int max_class = 0;
-                float max_score = 0;
-                for (int c = 0; c < OBJ_CLASS_NUM; c++) {
-                    float score = deqnt_affine_to_f32(data[(channel + 5 + c) * grid_h * grid_w + h * grid_w + w], zp, scale);
-                    if (score > max_score) { max_score = score; max_class = c; }
+    int grid_len = grid_h * grid_w;
+    int8_t thres_i8 = qnt_f32_to_affine(threshold, zp, scale);
+
+    for (int a = 0; a < 3; a++) {
+        for (int i = 0; i < grid_h; i++) {
+            for (int j = 0; j < grid_w; j++) {
+                int8_t box_confidence = input[(PROP_BOX_SIZE * a + 4) * grid_len + i * grid_w + j];
+                if (box_confidence >= thres_i8) {
+                    int offset = (PROP_BOX_SIZE * a) * grid_len + i * grid_w + j;
+                    int8_t *in_ptr = input + offset;
+                    float box_x = (deqnt_affine_to_f32(*in_ptr, zp, scale)) * 2.0f - 0.5f;
+                    float box_y = (deqnt_affine_to_f32(in_ptr[grid_len], zp, scale)) * 2.0f - 0.5f;
+                    float box_w = (deqnt_affine_to_f32(in_ptr[2 * grid_len], zp, scale)) * 2.0f;
+                    float box_h = (deqnt_affine_to_f32(in_ptr[3 * grid_len], zp, scale)) * 2.0f;
+                    box_x = (box_x + j) * (float)stride;
+                    box_y = (box_y + i) * (float)stride;
+                    box_w = box_w * box_w * (float)anchor[a * 2];
+                    box_h = box_h * box_h * (float)anchor[a * 2 + 1];
+                    box_x -= (box_w / 2.0f);
+                    box_y -= (box_h / 2.0f);
+
+                    int8_t maxClassProbs = in_ptr[5 * grid_len];
+                    int maxClassId = 0;
+                    for (int k = 1; k < OBJ_CLASS_NUM; k++) {
+                        int8_t prob = in_ptr[(5 + k) * grid_len];
+                        if (prob > maxClassProbs) {
+                            maxClassId = k;
+                            maxClassProbs = prob;
+                        }
+                    }
+                    if (maxClassProbs > thres_i8) {
+                        objProbs.push_back(deqnt_affine_to_f32(maxClassProbs, zp, scale) *
+                                           deqnt_affine_to_f32(box_confidence, zp, scale));
+                        classId.push_back(maxClassId);
+                        boxes.push_back(box_x);
+                        boxes.push_back(box_y);
+                        boxes.push_back(box_w);
+                        boxes.push_back(box_h);
+                        validCount++;
+                    }
                 }
-                float final_conf = box_conf * max_score;
-                if (final_conf < threshold) continue;
-                
-                boxes.push_back((box_x * 2 - 0.5 + w) * stride);
-                boxes.push_back((box_y * 2 - 0.5 + h) * stride);
-                boxes.push_back(box_w * box_w * 4 * anchor[a * 2]);
-                boxes.push_back(box_h * box_h * 4 * anchor[a * 2 + 1]);
-                objProbs.push_back(final_conf);
-                classId.push_back(max_class);
-                validCount++;
             }
         }
     }
     return validCount;
 }
 
-static float iou(float x1, float y1, float w1, float h1, float x2, float y2, float w2, float h2) {
-    float lx = std::max(x1, x2), ly = std::max(y1, y2);
-    float rx = std::min(x1 + w1, x2 + w2), ry = std::min(y1 + h1, y2 + h2);
-    float inter = std::max(0.f, rx - lx) * std::max(0.f, ry - ly);
-    float union_area = w1 * h1 + w2 * h2 - inter;
-    return inter / (union_area + 1e-6f);
-}
-
 static void nms(std::vector<float> &boxes, std::vector<int> &classId,
-                std::vector<int> &indexArray, int c, float threshold) {
+                std::vector<int> &indexArray, int targetClass, float nms_thresh) {
     for (int i = 0; i < (int)indexArray.size(); i++) {
-        if (indexArray[i] == -1 || classId[indexArray[i]] != c) continue;
+        if (indexArray[i] == -1 || classId[indexArray[i]] != targetClass) continue;
         for (int j = i + 1; j < (int)indexArray.size(); j++) {
-            if (indexArray[j] == -1 || classId[indexArray[j]] != c) continue;
+            if (indexArray[j] == -1 || classId[indexArray[j]] != targetClass) continue;
             int n = indexArray[i], m = indexArray[j];
-            if (iou(boxes[n*4], boxes[n*4+1], boxes[n*4+2], boxes[n*4+3],
-                    boxes[m*4], boxes[m*4+1], boxes[m*4+2], boxes[m*4+3]) > threshold)
-                indexArray[j] = -1;
+            float x1 = std::max(boxes[n*4], boxes[m*4]);
+            float y1 = std::max(boxes[n*4+1], boxes[m*4+1]);
+            float x2 = std::min(boxes[n*4]+boxes[n*4+2], boxes[m*4]+boxes[m*4+2]);
+            float y2 = std::min(boxes[n*4+1]+boxes[n*4+3], boxes[m*4+1]+boxes[m*4+3]);
+            float w = std::max(0.0f, x2 - x1);
+            float h = std::max(0.0f, y2 - y1);
+            float inter = w * h;
+            float area1 = boxes[n*4+2] * boxes[n*4+3];
+            float area2 = boxes[m*4+2] * boxes[m*4+3];
+            float iou = inter / (area1 + area2 - inter + 1e-5f);
+            if (iou > nms_thresh) indexArray[j] = -1;
         }
     }
 }
 
-// ========== MPP 解码器 ==========
-class MppH264Decoder {
+// ============================================================================
+// MPP H.264 Decoder (legacy API)
+// ============================================================================
+
+class MPPH264Decoder {
 public:
-    MppH264Decoder() : ctx_(nullptr), api_(nullptr), got_info_(false), frame_count_(0) {}
-    
+    MPPH264Decoder(int id=0) : id_(id), ctx_(nullptr), api_(nullptr),
+        frm_grp_(nullptr), initialized_(false), width_(0), height_(0),
+        hor_stride_(0), ver_stride_(0), got_keyframe_(false),
+        send_count_(0), frame_count_(0), info_change_done_(false),
+        last_frame_buf_(nullptr), last_frame_size_(0) {}
+
+    ~MPPH264Decoder() {
+        if (frm_grp_) mpp_buffer_group_put(frm_grp_);
+        if (ctx_) mpp_destroy(ctx_);
+    }
+
     bool init() {
-        if (mpp_create(&ctx_, &api_) != MPP_OK) return false;
-        if (mpp_init(ctx_, MPP_CTX_DEC, MPP_VIDEO_CodingAVC) != MPP_OK) { mpp_destroy(ctx_); ctx_ = nullptr; return false; }
+        MPP_RET ret = mpp_create(&ctx_, &api_);
+        if (ret != MPP_OK) return false;
+        MppParam param = nullptr;
+        api_->control(ctx_, MPP_DEC_SET_PARSER_SPLIT_MODE, &param);
+        ret = mpp_init(ctx_, MPP_CTX_DEC, MPP_VIDEO_CodingAVC);
+        if (ret != MPP_OK) return false;
+        initialized_ = true;
+        printf("[MPP#%d] H.264 decoder initialized\n", id_);
         return true;
     }
-    
-    bool sendPacket(uint8_t *data, size_t size) {
-        MppPacket pkt = nullptr;
-        mpp_packet_init(&pkt, data, size);
-        MPP_RET ret = api_->decode_put_packet(ctx_, pkt);
-        mpp_packet_deinit(&pkt);
-        return ret == MPP_OK;
-    }
-    
-    bool getFrame(MppFrame *frame) {
-        MPP_RET ret = api_->decode_get_frame(ctx_, frame);
-        if (ret == MPP_OK && *frame) {
-            if (!got_info_) {
-                MppBufferGroup grp = nullptr;
-                mpp_buffer_group_get_internal(&grp, MPP_BUFFER_TYPE_ION);
-                api_->control(ctx_, MPP_DEC_SET_EXT_BUF_GROUP, grp);
-                mpp_buffer_group_limit_config(grp, 24, 12);
-                api_->control(ctx_, MPP_DEC_SET_INFO_CHANGE_READY, NULL);
-                got_info_ = true;
+
+    bool send_packet(const uint8_t* data, size_t size, bool is_keyframe = false) {
+        if (!initialized_ || !data || size == 0) return false;
+        int nalu_type = -1;
+        for (size_t i = 0; i + 4 < size; i++) {
+            if (data[i]==0 && data[i+1]==0 && data[i+2]==0 && data[i+3]==1) {
+                nalu_type = data[i+4] & 0x1F; break;
             }
-            frame_count_++;
-            return true;
         }
-        return false;
+        bool is_config = (nalu_type == 7 || nalu_type == 8) && !is_keyframe;
+        if (is_keyframe) { got_keyframe_ = true; printf("[MPP#%d] 关键帧 NALU=%d size=%zu\n", id_, nalu_type, size); }
+        if (!got_keyframe_ && !is_config) return false;
+
+        void* pkt_data = malloc(size);
+        if (!pkt_data) return false;
+        memcpy(pkt_data, data, size);
+        MppPacket packet = nullptr;
+        MPP_RET ret = mpp_packet_init(&packet, pkt_data, size);
+        if (ret != MPP_OK) { free(pkt_data); return false; }
+        mpp_packet_set_length(packet, size);
+        ret = api_->decode_put_packet(ctx_, packet);
+        mpp_packet_deinit(&packet);
+        if (ret == -1012) {
+            drain_frames();
+            void* rdata = malloc(size); if (!rdata) return false;
+            memcpy(rdata, data, size);
+            MppPacket rpkt = nullptr;
+            ret = mpp_packet_init(&rpkt, rdata, size);
+            if (ret != MPP_OK) { free(rdata); return false; }
+            mpp_packet_set_length(rpkt, size);
+            ret = api_->decode_put_packet(ctx_, rpkt);
+            mpp_packet_deinit(&rpkt);
+            if (ret != MPP_OK) return false;
+        } else if (ret != MPP_OK) { return false; }
+        send_count_++;
+        return true;
     }
-    
-    void close() { if (ctx_) { mpp_destroy(ctx_); ctx_ = nullptr; } }
-    int frameCount() const { return frame_count_; }
+
+    typedef std::function<void(const uint8_t* nv12, int w, int h, int hs, int vs)> FrameCallback;
+    int drain_frames(FrameCallback cb = nullptr) {
+        int got = 0;
+        while (true) {
+            MppFrame frame = nullptr;
+            MPP_RET ret = api_->decode_get_frame(ctx_, &frame);
+            if (ret != MPP_OK || !frame) break;
+            if (mpp_frame_get_info_change(frame)) { handle_info_change(frame); mpp_frame_deinit(&frame); continue; }
+            MppBuffer frm_buf = mpp_frame_get_buffer(frame);
+            if (frm_buf) {
+                width_ = mpp_frame_get_width(frame);
+                height_ = mpp_frame_get_height(frame);
+                hor_stride_ = mpp_frame_get_hor_stride(frame);
+                ver_stride_ = mpp_frame_get_ver_stride(frame);
+                size_t buf_size = mpp_buffer_get_size(frm_buf);
+                uint8_t* src = (uint8_t*)mpp_buffer_get_ptr(frm_buf);
+                if (buf_size > last_frame_size_) { last_frame_data_.resize(buf_size); last_frame_size_ = buf_size; }
+                memcpy(last_frame_data_.data(), src, buf_size);
+                last_frame_buf_ = last_frame_data_.data();
+                frame_count_++;
+                if (frame_count_ <= 5 || frame_count_ % 100 == 0)
+                    printf("[MPP#%d] Frame #%d, %dx%d (stride %d:%d)\n", id_, frame_count_, width_, height_, hor_stride_, ver_stride_);
+                got++;
+                if (cb) cb(last_frame_buf_, width_, height_, hor_stride_, ver_stride_);
+            }
+            mpp_frame_deinit(&frame);
+        }
+        return got;
+    }
+
+    uint8_t* get_last_frame() const { return last_frame_buf_; }
+    uint32_t get_width() const { return width_; }
+    uint32_t get_height() const { return height_; }
+    uint32_t get_hor_stride() const { return hor_stride_; }
+    uint32_t get_ver_stride() const { return ver_stride_; }
+    int get_frame_count() const { return frame_count_; }
+    int get_send_count() const { return send_count_; }
 
 private:
-    MppCtx ctx_;
-    MppApi *api_;
-    bool got_info_;
-    int frame_count_;
+    void handle_info_change(MppFrame frame) {
+        uint32_t w = mpp_frame_get_width(frame), h = mpp_frame_get_height(frame);
+        uint32_t hs = mpp_frame_get_hor_stride(frame), vs = mpp_frame_get_ver_stride(frame);
+        uint32_t bs = mpp_frame_get_buf_size(frame);
+        printf("[MPP#%d] Info change: %dx%d, stride [%d:%d], buf_size=%d\n", id_, w, h, hs, vs, bs);
+        if (info_change_done_) { api_->control(ctx_, MPP_DEC_SET_INFO_CHANGE_READY, NULL); return; }
+        MppBufferGroup grp = nullptr;
+        MPP_RET ret = mpp_buffer_group_get_internal(&grp, MPP_BUFFER_TYPE_ION);
+        if (ret != MPP_OK) ret = mpp_buffer_group_get_internal(&grp, MPP_BUFFER_TYPE_DMA_HEAP);
+        if (ret != MPP_OK) return;
+        for (int i = 0; i < 24; i++) { MppBuffer fb; mpp_buffer_get(grp, &fb, bs); }
+        ret = api_->control(ctx_, MPP_DEC_SET_EXT_BUF_GROUP, grp);
+        if (ret != MPP_OK) { mpp_buffer_group_put(grp); return; }
+        frm_grp_ = grp;
+        api_->control(ctx_, MPP_DEC_SET_INFO_CHANGE_READY, NULL);
+        info_change_done_ = true;
+        width_ = w; height_ = h; hor_stride_ = hs; ver_stride_ = vs;
+        printf("[MPP#%d] Info change handled\n", id_);
+    }
+
+    int id_; MppCtx ctx_; MppApi* api_; MppBufferGroup frm_grp_;
+    bool initialized_; uint32_t width_, height_, hor_stride_, ver_stride_;
+    bool got_keyframe_; int send_count_, frame_count_; bool info_change_done_;
+    std::vector<uint8_t> last_frame_data_; uint8_t* last_frame_buf_; size_t last_frame_size_;
 };
 
-// ========== RKNN 推理器 ==========
-class RKNNInferencer {
+// ============================================================================
+
+// RKNN Inference (correct YOLOv5 2-class post-process)
+// ============================================================================
+class RKNNInference {
 public:
-    RKNNInferencer() : ctx_(0), initialized_(false), id_(-1), n_output_(0) {}
-    
-    bool init(int id, rknn_core_mask core_mask) {
-        id_ = id;
-        FILE *fp = fopen(MODEL_PATH, "rb");
+    RKNNInference() : ctx_(0), initialized_(false), model_width_(0), model_height_(0), model_channel_(3) {}
+    ~RKNNInference() { if (ctx_) rknn_destroy(ctx_); }
+
+    bool init(const std::string& model_path, rknn_core_mask core_mask = RKNN_NPU_CORE_0) {
+        FILE* fp = fopen(model_path.c_str(), "rb");
         if (!fp) return false;
         fseek(fp, 0, SEEK_END); size_t sz = ftell(fp); fseek(fp, 0, SEEK_SET);
-        std::vector<char> data(sz);
-        fread(data.data(), 1, sz, fp);
+        std::vector<uint8_t> data(sz);
+        if (fread(data.data(), 1, sz, fp) != sz) { fclose(fp); return false; }
         fclose(fp);
-        
-        if (rknn_init(&ctx_, data.data(), sz, 0, NULL) < 0) return false;
+        if (rknn_init(&ctx_, data.data(), sz, 0, nullptr) < 0) return false;
         rknn_set_core_mask(ctx_, core_mask);
-        
+
         rknn_input_output_num io;
         rknn_query(ctx_, RKNN_QUERY_IN_OUT_NUM, &io, sizeof(io));
-        n_output_ = io.n_output;
-        
-        for (int i = 0; i < n_output_; i++) {
-            output_attrs_[i].index = i;
-            rknn_query(ctx_, RKNN_QUERY_OUTPUT_ATTR, &output_attrs_[i], sizeof(output_attrs_[i]));
+
+        rknn_tensor_attr input_attrs[1];
+        memset(input_attrs, 0, sizeof(input_attrs));
+        input_attrs[0].index = 0;
+        rknn_query(ctx_, RKNN_QUERY_INPUT_ATTR, input_attrs, sizeof(input_attrs));
+
+        if (input_attrs[0].fmt == RKNN_TENSOR_NHWC) {
+            model_height_ = input_attrs[0].dims[1];
+            model_width_ = input_attrs[0].dims[2];
+            model_channel_ = input_attrs[0].dims[3];
+        } else {
+            model_channel_ = input_attrs[0].dims[1];
+            model_height_ = input_attrs[0].dims[2];
+            model_width_ = input_attrs[0].dims[3];
         }
-        
+
+        // Query output attrs for zp and scale
+        n_output_ = io.n_output;
+        for (int i = 0; i < n_output_ && i < 3; i++) {
+            output_attrs_[i].index = i;
+            rknn_query(ctx_, RKNN_QUERY_OUTPUT_ATTR, &output_attrs_[i], sizeof(rknn_tensor_attr));
+            printf("[RKNN] Output[%d]: dims=[%d,%d,%d,%d] size=%d type=%d qnt=%d zp=%d scale=%f\n",
+                   i, output_attrs_[i].dims[0], output_attrs_[i].dims[1], output_attrs_[i].dims[2],
+                   output_attrs_[i].dims[3], output_attrs_[i].size, output_attrs_[i].type,
+                   output_attrs_[i].qnt_type, output_attrs_[i].zp, output_attrs_[i].scale);
+        }
+
+        printf("[RKNN] Core=0x%x, Model: %dx%dx%d, Outputs: %d\n",
+               core_mask, model_width_, model_height_, model_channel_, n_output_);
         initialized_ = true;
-        printf("[RKNN#%d] Initialized, core=%d, outputs=%d\n", id, (int)core_mask, n_output_);
         return true;
     }
-    
-    int infer(uint8_t *rgb_data, int src_w, int src_h, std::vector<detect_result_t> &results) {
-        if (!initialized_) return -1;
-        
-        rknn_input input = {};
-        input.index = 0; input.type = RKNN_TENSOR_UINT8;
-        input.size = MODEL_INPUT_SIZE * MODEL_INPUT_SIZE * 3; input.buf = rgb_data;
-        
-        if (rknn_inputs_set(ctx_, 1, &input) != RKNN_SUCC) return -2;
-        if (rknn_run(ctx_, NULL) != RKNN_SUCC) return -3;
-        
-        rknn_output outputs[3] = {};
-        for (int i = 0; i < n_output_; i++) outputs[i].want_float = 1;
-        if (rknn_outputs_get(ctx_, n_output_, outputs, NULL) != RKNN_SUCC) return -4;
-        
-        int grid_h0 = MODEL_INPUT_SIZE/8, grid_w0 = MODEL_INPUT_SIZE/8;
-        int grid_h1 = MODEL_INPUT_SIZE/16, grid_w1 = MODEL_INPUT_SIZE/16;
-        int grid_h2 = MODEL_INPUT_SIZE/32, grid_w2 = MODEL_INPUT_SIZE/32;
-        
+
+    int infer_nv12(const uint8_t* nv12_data, int src_w, int src_h,
+                   int hor_stride, int ver_stride,
+                   std::vector<detect_result_t>& results) {
+        if (!initialized_) return 0;
+
+        // RGA: NV12 → RGB resize
+        rga_buffer_t src_img, dst_img;
+        im_rect src_rect, dst_rect;
+        memset(&src_img, 0, sizeof(src_img)); memset(&dst_img, 0, sizeof(dst_img));
+        memset(&src_rect, 0, sizeof(src_rect)); memset(&dst_rect, 0, sizeof(dst_rect));
+
+        src_img = wrapbuffer_virtualaddr((void*)nv12_data, src_w, src_h,
+                                          RK_FORMAT_YCbCr_420_SP, hor_stride, ver_stride);
+        std::vector<uint8_t> rgb_buf(model_width_ * model_height_ * model_channel_);
+        dst_img = wrapbuffer_virtualaddr((void*)rgb_buf.data(), model_width_, model_height_, RK_FORMAT_RGB_888);
+
+        IM_STATUS chk = imcheck(src_img, dst_img, src_rect, dst_rect);
+        if (chk != IM_STATUS_NOERROR) { printf("[Infer] RGA check fail: %s\n", imStrError(chk)); return 0; }
+        IM_STATUS st = imresize(src_img, dst_img);
+        if (st != IM_STATUS_SUCCESS) { printf("[Infer] RGA resize fail: %s\n", imStrError(st)); return 0; }
+
+        // RKNN input
+        rknn_input input;
+        memset(&input, 0, sizeof(input));
+        input.index = 0;
+        input.type = RKNN_TENSOR_UINT8;
+        input.size = model_width_ * model_height_ * model_channel_;
+        input.fmt = RKNN_TENSOR_NHWC;
+        input.pass_through = 0;
+        input.buf = (void*)rgb_buf.data();
+
+        if (rknn_inputs_set(ctx_, 1, &input) < 0) return 0;
+        if (rknn_run(ctx_, nullptr) < 0) return 0;
+
+        // Get int8 outputs (NOT float!)
+        rknn_output outputs[3];
+        memset(outputs, 0, sizeof(outputs));
+        for (int i = 0; i < n_output_ && i < 3; i++) {
+            outputs[i].want_float = 0;  // int8 output!
+            outputs[i].is_prealloc = 0;
+        }
+        if (rknn_outputs_get(ctx_, n_output_, outputs, nullptr) < 0) return 0;
+
+        // YOLOv5 post-process with int8 dequantization
         std::vector<float> filterBoxes, objProbs;
         std::vector<int> classId;
-        int validCount = 0;
-        
+
+        int stride0 = 8, grid_h0 = model_height_ / stride0, grid_w0 = model_width_ / stride0;
+        int stride1 = 16, grid_h1 = model_height_ / stride1, grid_w1 = model_width_ / stride1;
+        int stride2 = 32, grid_h2 = model_height_ / stride2, grid_w2 = model_width_ / stride2;
+
+        int validCount0 = 0, validCount1 = 0, validCount2 = 0;
+
         if (n_output_ >= 1 && outputs[0].size > 0)
-            validCount += process_feature((int8_t*)outputs[0].buf, (int*)anchor0,
-                grid_h0, grid_w0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, 8,
-                filterBoxes, objProbs, classId, BOX_THRESH, output_attrs_[0].zp, output_attrs_[0].scale);
+            validCount0 = process_feature((int8_t*)outputs[0].buf, (int*)anchor0,
+                grid_h0, grid_w0, model_height_, model_width_, stride0,
+                filterBoxes, objProbs, classId, BOX_THRESH,
+                output_attrs_[0].zp, output_attrs_[0].scale);
+
         if (n_output_ >= 2 && outputs[1].size > 0)
-            validCount += process_feature((int8_t*)outputs[1].buf, (int*)anchor1,
-                grid_h1, grid_w1, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, 16,
-                filterBoxes, objProbs, classId, BOX_THRESH, output_attrs_[1].zp, output_attrs_[1].scale);
+            validCount1 = process_feature((int8_t*)outputs[1].buf, (int*)anchor1,
+                grid_h1, grid_w1, model_height_, model_width_, stride1,
+                filterBoxes, objProbs, classId, BOX_THRESH,
+                output_attrs_[1].zp, output_attrs_[1].scale);
+
         if (n_output_ >= 3 && outputs[2].size > 0)
-            validCount += process_feature((int8_t*)outputs[2].buf, (int*)anchor2,
-                grid_h2, grid_w2, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, 32,
-                filterBoxes, objProbs, classId, BOX_THRESH, output_attrs_[2].zp, output_attrs_[2].scale);
-        
+            validCount2 = process_feature((int8_t*)outputs[2].buf, (int*)anchor2,
+                grid_h2, grid_w2, model_height_, model_width_, stride2,
+                filterBoxes, objProbs, classId, BOX_THRESH,
+                output_attrs_[2].zp, output_attrs_[2].scale);
+
+        int validCount = validCount0 + validCount1 + validCount2;
+
         if (validCount > 0) {
-            std::vector<int> indexArray(validCount);
-            for (int i = 0; i < validCount; i++) indexArray[i] = i;
+            // NMS
+            std::vector<int> indexArray;
+            for (int i = 0; i < validCount; i++) indexArray.push_back(i);
+            // Sort by confidence (descending)
             for (int i = 0; i < validCount - 1; i++)
                 for (int j = i + 1; j < validCount; j++)
                     if (objProbs[indexArray[i]] < objProbs[indexArray[j]])
                         std::swap(indexArray[i], indexArray[j]);
-            
+
             std::set<int> class_set(classId.begin(), classId.end());
-            for (auto c : class_set) nms(filterBoxes, classId, indexArray, c, NMS_THRESH);
-            
-            float scale_w = (float)src_w / MODEL_INPUT_SIZE;
-            float scale_h = (float)src_h / MODEL_INPUT_SIZE;
-            
+            for (auto c : class_set)
+                nms(filterBoxes, classId, indexArray, c, NMS_THRESH);
+
+            // Scale from model coords to source image coords
+            float scale_w = (float)src_w / model_width_;
+            float scale_h = (float)src_h / model_height_;
+
             for (int i = 0; i < validCount; i++) {
                 if (indexArray[i] == -1) continue;
                 int n = indexArray[i];
                 detect_result_t r;
-                r.left   = clamp_i(filterBoxes[n*4+0], 0, MODEL_INPUT_SIZE) * scale_w;
-                r.top    = clamp_i(filterBoxes[n*4+1], 0, MODEL_INPUT_SIZE) * scale_h;
-                r.right  = clamp_i(filterBoxes[n*4+0] + filterBoxes[n*4+2], 0, MODEL_INPUT_SIZE) * scale_w;
-                r.bottom = clamp_i(filterBoxes[n*4+1] + filterBoxes[n*4+3], 0, MODEL_INPUT_SIZE) * scale_h;
+                r.left   = clamp_i(filterBoxes[n*4+0], 0, model_width_) * scale_w;
+                r.top    = clamp_i(filterBoxes[n*4+1], 0, model_height_) * scale_h;
+                r.right  = clamp_i(filterBoxes[n*4+0] + filterBoxes[n*4+2], 0, model_width_) * scale_w;
+                r.bottom = clamp_i(filterBoxes[n*4+1] + filterBoxes[n*4+3], 0, model_height_) * scale_h;
                 r.prop = objProbs[n];
                 r.class_id = classId[n];
                 results.push_back(r);
             }
         }
-        
+
         rknn_outputs_release(ctx_, n_output_, outputs);
         return (int)results.size();
     }
-    
-    ~RKNNInferencer() { if (initialized_) rknn_destroy(ctx_); }
 
 private:
-    int id_;
     rknn_context ctx_;
     bool initialized_;
+    int model_width_, model_height_, model_channel_;
     int n_output_;
     rknn_tensor_attr output_attrs_[3];
 };
 
-// ========== 基准测试 ==========
-class MultiRTSPBenchmark {
-public:
-    MultiRTSPBenchmark(int channels, int duration_sec)
-        : num_channels_(channels), duration_sec_(duration_sec), running_(false) {}
-    
-    void run() {
-        printf("\n");
-        printf("========================================================\n");
-        printf("  Multi-RTSP + MPP + RKNN Performance Benchmark\n");
-        printf("========================================================\n");
-        printf("  Channels: %d  |  Duration: %ds\n", num_channels_, duration_sec_);
-        printf("  Model:    %s\n", MODEL_PATH);
-        printf("  BOX_THRESH: %.2f  NMS_THRESH: %.2f\n", BOX_THRESH, NMS_THRESH);
-        printf("========================================================\n\n");
-        
-        rknn_core_mask core_masks[] = { RKNN_NPU_CORE_0, RKNN_NPU_CORE_1, RKNN_NPU_CORE_2 };
-        for (int i = 0; i < num_channels_; i++) {
-            rknn_core_mask core = core_masks[i % 3];
-            if (!rknn_[i].init(i, core)) {
-                printf("[FATAL] RKNN#%d init failed\n", i);
-                return;
-            }
-            stats_[i].channel_id = i;
-            stats_[i].core_mask = core;
-        }
-        
-        running_ = true;
-        
-        std::vector<std::thread> threads;
-        for (int i = 0; i < num_channels_; i++)
-            threads.emplace_back(&MultiRTSPBenchmark::channelLoop, this, i);
-        
-        std::thread monitor(&MultiRTSPBenchmark::monitorLoop, this);
-        
-        std::this_thread::sleep_for(std::chrono::seconds(duration_sec_));
-        running_ = false;
-        
-        for (auto &t : threads) t.join();
-        monitor.join();
-        
-        printResults();
-    }
+// ============================================================================
+// Main
+// ============================================================================
 
-private:
-    void channelLoop(int ch) {
-        printf("[CH%d] Starting, RTSP: %s\n", ch, RTSP_URLS[ch]);
-        
-        AVFormatContext *fmt_ctx = nullptr;
-        AVDictionary *opts = nullptr;
-        av_dict_set(&opts, "rtsp_transport", "tcp", 0);
-        av_dict_set(&opts, "stimeout", "5000000", 0);
-        av_dict_set(&opts, "fflags", "nobuffer", 0);
-        av_dict_set(&opts, "max_delay", "500000", 0);
-        
-        if (avformat_open_input(&fmt_ctx, RTSP_URLS[ch], nullptr, &opts) < 0) {
-            av_dict_free(&opts);
-            printf("[CH%d] Failed to open RTSP\n", ch);
-            return;
-        }
+
+// ========== Multi-channel Benchmark ==========
+static std::atomic<bool> g_bench_running{false};
+static ChannelStats* g_stats[MAX_CHANNELS] = {nullptr};
+
+void channel_loop(int ch, const char* rtsp_url, RKNNInference* rknn, int duration_sec) {
+    ChannelStats& stats = *g_stats[ch];
+    printf("[CH%d] Starting, RTSP: %s\n", ch, rtsp_url);
+    
+    MPPH264Decoder decoder(ch);
+    if (!decoder.init()) { printf("[CH%d] MPP init failed\n", ch); return; }
+    
+    avformat_network_init();
+    AVFormatContext* fmt_ctx = nullptr;
+    AVDictionary* opts = nullptr;
+    av_dict_set(&opts, "rtsp_transport", "tcp", 0);
+    av_dict_set(&opts, "stimeout", "5000000", 0);
+    av_dict_set(&opts, "fflags", "nobuffer", 0);
+    av_dict_set(&opts, "max_delay", "500000", 0);
+    
+    if (avformat_open_input(&fmt_ctx, rtsp_url, nullptr, &opts) < 0) {
         av_dict_free(&opts);
-        
-        int video_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
-        if (video_idx < 0) { avformat_close_input(&fmt_ctx); return; }
-        
-        AVCodecParameters *codecpar = fmt_ctx->streams[video_idx]->codecpar;
-        printf("[CH%d] Video: %dx%d, codec=%d\n", ch, codecpar->width, codecpar->height, codecpar->codec_id);
-        
-        MppH264Decoder decoder;
-        if (!decoder.init()) { avformat_close_input(&fmt_ctx); return; }
-        
-        if (codecpar->extradata_size > 0)
-            decoder.sendPacket(codecpar->extradata, codecpar->extradata_size);
-        
-        uint8_t *rgb_buf = (uint8_t*)malloc(MODEL_INPUT_SIZE * MODEL_INPUT_SIZE * 3);
-        bool got_keyframe = false;
-        AVPacket *avpkt = av_packet_alloc();
-        
-        while (running_ && av_read_frame(fmt_ctx, avpkt) >= 0) {
-            if (avpkt->stream_index != video_idx) { av_packet_unref(avpkt); continue; }
-            
-            bool is_keyframe = (avpkt->flags & AV_PKT_FLAG_KEY) != 0;
-            if (!got_keyframe && !is_keyframe) { av_packet_unref(avpkt); continue; }
-            if (is_keyframe) got_keyframe = true;
-            
-            auto t_decode_start = std::chrono::steady_clock::now();
-            decoder.sendPacket(avpkt->data, avpkt->size);
-            
-            MppFrame frame = nullptr;
-            while (decoder.getFrame(&frame) && frame) {
-                int w = mpp_frame_get_width(frame);
-                int h = mpp_frame_get_height(frame);
-                MppBuffer buf = mpp_frame_get_buffer(frame);
-                
-                if (buf) {
-                    auto t_decode_end = std::chrono::steady_clock::now();
-                    double decode_ms = std::chrono::duration<double, std::milli>(t_decode_end - t_decode_start).count();
-                    stats_[ch].decode_count++;
-                    stats_[ch].decode_ms_sum += decode_ms;
-                    
-                    rga_buffer_t src_img = wrapbuffer_fd(mpp_buffer_get_fd(buf), w, h, RK_FORMAT_YCbCr_420_SP);
-                    rga_buffer_t dst_img = wrapbuffer_virtualaddr(rgb_buf, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, RK_FORMAT_BGR_888);
-                    
-                    if (imresize(src_img, dst_img) != IM_STATUS_SUCCESS) {
-                        mpp_frame_deinit(&frame);
-                        continue;
-                    }
-                    
-                    auto t_infer_start = std::chrono::steady_clock::now();
-                    std::vector<detect_result_t> results;
-                    int det_count = rknn_[ch].infer(rgb_buf, w, h, results);
-                    auto t_infer_end = std::chrono::steady_clock::now();
-                    
-                    double infer_ms = std::chrono::duration<double, std::milli>(t_infer_end - t_infer_start).count();
-                    double e2e_ms = std::chrono::duration<double, std::milli>(t_infer_end - t_decode_start).count();
-                    
-                    stats_[ch].infer_count++;
-                    stats_[ch].infer_ms_sum += infer_ms;
-                    stats_[ch].e2e_ms_sum += e2e_ms;
-                    stats_[ch].detect_count += det_count;
-                    stats_[ch].infer_latencies.push_back(infer_ms);
-                    stats_[ch].e2e_latencies.push_back(e2e_ms);
-                }
-                mpp_frame_deinit(&frame);
-            }
-            av_packet_unref(avpkt);
-        }
-        
-        av_packet_free(&avpkt);
-        free(rgb_buf);
-        decoder.close();
-        avformat_close_input(&fmt_ctx);
-        printf("[CH%d] Loop ended. Decoded: %d, Inferred: %d\n", ch, stats_[ch].decode_count, stats_[ch].infer_count);
+        printf("[CH%d] Failed to open RTSP\n", ch); return;
     }
+    av_dict_free(&opts);
     
-    void monitorLoop() {
-        int elapsed = 0;
-        while (running_) {
-            std::this_thread::sleep_for(std::chrono::seconds(5));
-            elapsed += 5;
-            printf("\n--- [%ds] Live Stats ---\n", elapsed);
-            for (int i = 0; i < num_channels_; i++) {
-                double fps = stats_[i].infer_count > 0 ? (double)stats_[i].infer_count / elapsed : 0;
-                printf("  CH%d: %d frames, %.1f fps, avg_infer=%.1fms, detections=%d\n",
-                       i, stats_[i].infer_count, fps,
-                       stats_[i].infer_count > 0 ? stats_[i].infer_ms_sum / stats_[i].infer_count : 0,
-                       stats_[i].detect_count);
-            }
-            FILE *npu_fp = fopen("/sys/kernel/debug/rknpu/load", "r");
-            if (npu_fp) {
-                char buf[256];
-                if (fgets(buf, sizeof(buf), npu_fp)) printf("  NPU: %s", buf);
-                fclose(npu_fp);
+    int video_stream = -1;
+    for (unsigned i = 0; i < fmt_ctx->nb_streams; i++)
+        if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) { video_stream = (int)i; break; }
+    if (video_stream < 0) { avformat_close_input(&fmt_ctx); return; }
+    
+    AVStream* vst = fmt_ctx->streams[video_stream];
+    printf("[CH%d] Video: %dx%d, codec=%d\n", ch, vst->codecpar->width, vst->codecpar->height, vst->codecpar->codec_id);
+    
+    // Send extradata
+    if (vst->codecpar->extradata && vst->codecpar->extradata_size > 0) {
+        int sz = vst->codecpar->extradata_size;
+        uint8_t* ed = vst->codecpar->extradata;
+        bool is_annexb = (sz >= 4 && ed[0]==0 && ed[1]==0 && ed[2]==0 && ed[3]==1);
+        if (is_annexb) { decoder.send_packet(ed, sz, false); }
+        else {
+            int pos = 6;
+            while (pos + 2 < sz) {
+                int nl = (ed[pos]<<8)|ed[pos+1]; pos += 2;
+                if (pos + nl > sz) break;
+                std::vector<uint8_t> sc(4+nl); sc[0]=0;sc[1]=0;sc[2]=0;sc[3]=1;
+                memcpy(sc.data()+4, &ed[pos], nl);
+                decoder.send_packet(sc.data(), sc.size(), false);
+                pos += nl;
             }
         }
     }
     
-    void printResults() {
-        printf("\n\n========================================================\n");
-        printf("  BENCHMARK RESULTS SUMMARY\n");
-        printf("========================================================\n");
-        printf("  Channels: %d  |  Duration: %ds  |  Model: YOLOv5s\n", num_channels_, duration_sec_);
-        printf("  BOX_THRESH: %.2f  |  NMS_THRESH: %.2f\n", BOX_THRESH, NMS_THRESH);
-        printf("========================================================\n\n");
-        
-        int total_infer = 0, total_detect = 0;
-        
-        printf("Channel | NPU Core | Frames |   FPS  | Avg Infer | P99 Infer | Min Infer | Max Infer | Detections\n");
-        printf("--------|----------|--------|--------|-----------|-----------|-----------|-----------|----------\n");
-        
-        for (int i = 0; i < num_channels_; i++) {
-            double fps = (double)stats_[i].infer_count / duration_sec_;
-            printf("  CH%d   |  Core %d  | %6d | %6.1f | %7.2fms | %7.2fms | %7.2fms | %7.2fms | %8d\n",
-                   i, (int)stats_[i].core_mask, stats_[i].infer_count, fps,
-                   stats_[i].inferAvg(), stats_[i].inferP99(),
-                   stats_[i].inferMin(), stats_[i].inferMax(), stats_[i].detect_count);
-            total_infer += stats_[i].infer_count;
-            total_detect += stats_[i].detect_count;
-        }
-        
-        double total_fps = (double)total_infer / duration_sec_;
-        printf("--------|----------|--------|--------|-----------|-----------|-----------|-----------|----------\n");
-        printf("  TOTAL |    -     | %6d | %6.1f |     -     |     -     |     -     |     -     | %8d\n",
-               total_infer, total_fps, total_detect);
-        
-        printf("\n--- End-to-End Latency (Decode + RGA + Infer) ---\n");
-        for (int i = 0; i < num_channels_; i++)
-            printf("  CH%d: avg=%.2fms\n", i, stats_[i].e2eAvg());
-        
-        printf("\n--- Decode Performance ---\n");
-        for (int i = 0; i < num_channels_; i++) {
-            double avg_decode = stats_[i].decode_count > 0 ? stats_[i].decode_ms_sum / stats_[i].decode_count : 0;
-            printf("  CH%d: %d frames, avg=%.2fms\n", i, stats_[i].decode_count, avg_decode);
-        }
-        
-        printf("\n--- NPU Load ---\n");
-        FILE *npu_fp = fopen("/sys/kernel/debug/rknpu/load", "r");
-        if (npu_fp) {
-            char buf[256];
-            while (fgets(buf, sizeof(buf), npu_fp)) printf("  %s", buf);
-            fclose(npu_fp);
-        }
-        
-        printf("\n--- Comparison: FFmpeg Soft Decode vs MPP Hardware Decode ---\n");
-        printf("Metric               | FFmpeg Soft  | MPP Hardware\n");
-        printf("---------------------|--------------|-------------\n");
-        printf("%d-ch Total FPS       |    ~30       |   %7.1f\n", num_channels_, total_fps);
-        printf("Per-channel FPS      |    <30       |   %7.1f\n", total_fps / num_channels_);
-        printf("NPU Utilization      |    ~55%%      |     ~82%%\n");
-        printf("CPU Usage            |    High      |     Low\n");
-        
-        // 保存 CSV
-        std::string result_file = "benchmark_" + std::to_string(num_channels_) + "ch_" + std::to_string(duration_sec_) + "s.csv";
-        FILE *fp = fopen(result_file.c_str(), "w");
-        if (fp) {
-            fprintf(fp, "channel,npu_core,frames,fps,avg_infer_ms,p99_infer_ms,min_infer_ms,max_infer_ms,detections,e2e_avg_ms\n");
-            for (int i = 0; i < num_channels_; i++) {
-                double fps = (double)stats_[i].infer_count / duration_sec_;
-                fprintf(fp, "%d,%d,%d,%.1f,%.2f,%.2f,%.2f,%.2f,%d,%.2f\n",
-                       i, (int)stats_[i].core_mask, stats_[i].infer_count, fps,
-                       stats_[i].inferAvg(), stats_[i].inferP99(),
-                       stats_[i].inferMin(), stats_[i].inferMax(),
-                       stats_[i].detect_count, stats_[i].e2eAvg());
+    AVPacket* pkt = av_packet_alloc();
+    int64_t start_time = get_time_ms();
+    
+    while (g_bench_running && (get_time_ms() - start_time) < duration_sec * 1000) {
+        int ret = av_read_frame(fmt_ctx, pkt);
+        if (ret < 0) {
+            printf("[CH%d] RTSP read failed, reconnecting...\n", ch);
+            avformat_close_input(&fmt_ctx); fmt_ctx = nullptr;
+            AVDictionary* opts2 = nullptr;
+            av_dict_set(&opts2, "rtsp_transport", "tcp", 0);
+            av_dict_set(&opts2, "stimeout", "5000000", 0);
+            if (avformat_open_input(&fmt_ctx, rtsp_url, nullptr, &opts2) < 0) {
+                av_dict_free(&opts2);
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+                continue;
             }
-            fclose(fp);
-            printf("\nResults saved to: %s\n", result_file.c_str());
+            av_dict_free(&opts2);
+            video_stream = -1;
+            for (unsigned i = 0; i < fmt_ctx->nb_streams; i++)
+                if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) { video_stream = (int)i; break; }
+            if (video_stream < 0) { avformat_close_input(&fmt_ctx); fmt_ctx = nullptr; continue; }
+            vst = fmt_ctx->streams[video_stream];
+            if (vst->codecpar->extradata && vst->codecpar->extradata_size > 0)
+                decoder.send_packet(vst->codecpar->extradata, vst->codecpar->extradata_size, false);
+            continue;
         }
         
-        printf("\nBenchmark complete.\n");
+        if (pkt->stream_index != video_stream) { av_packet_unref(pkt); continue; }
+        bool is_keyframe = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
+        
+        auto t_decode_start = std::chrono::steady_clock::now();
+        decoder.send_packet(pkt->data, pkt->size, is_keyframe);
+        
+        decoder.drain_frames([&](const uint8_t* nv12, int w, int h, int hs, int vs) {
+            auto t_decode_end = std::chrono::steady_clock::now();
+            double decode_ms = std::chrono::duration<double, std::milli>(t_decode_end - t_decode_start).count();
+            stats.decode_count.fetch_add(1);
+            stats.addDecodeMs(decode_ms);
+            
+            auto t_infer_start = std::chrono::steady_clock::now();
+            std::vector<detect_result_t> results;
+            int det_count = rknn->infer_nv12(nv12, w, h, hs, vs, results);
+            auto t_infer_end = std::chrono::steady_clock::now();
+            
+            double infer_ms = std::chrono::duration<double, std::milli>(t_infer_end - t_infer_start).count();
+            double e2e_ms = std::chrono::duration<double, std::milli>(t_infer_end - t_decode_start).count();
+            
+            stats.infer_count.fetch_add(1);
+            stats.addInferMs(infer_ms);
+            stats.addE2EMs(e2e_ms);
+            stats.detect_count.fetch_add(det_count);
+            stats.addInferLatency(infer_ms);
+        });
+        av_packet_unref(pkt);
     }
+    
+    av_packet_free(&pkt);
+    avformat_close_input(&fmt_ctx);
+    printf("[CH%d] Loop ended. Decoded: %d, Inferred: %d\n", ch, stats.decode_count.load(), stats.infer_count.load());
+}
 
-private:
-    int num_channels_;
-    int duration_sec_;
-    std::atomic<bool> running_;
-    RKNNInferencer rknn_[MAX_CHANNELS];
-    ChannelStats stats_[MAX_CHANNELS];
-};
-
-int main(int argc, char *argv[]) {
-    int channels = 4, duration = 60;
-    if (argc >= 2) channels = atoi(argv[1]);
-    if (argc >= 3) duration = atoi(argv[2]);
-    if (channels < 1 || channels > MAX_CHANNELS) {
+int main(int argc, char* argv[]) {
+    int num_channels = 4, duration_sec = BENCH_DURATION;
+    if (argc >= 2) num_channels = atoi(argv[1]);
+    if (argc >= 3) duration_sec = atoi(argv[2]);
+    if (num_channels < 1 || num_channels > MAX_CHANNELS) {
         printf("Usage: %s [channels 1-%d] [duration_seconds]\n", argv[0], MAX_CHANNELS);
         return 1;
     }
-    MultiRTSPBenchmark bench(channels, duration);
-    bench.run();
+    
+    printf("\n========================================================\n");
+    printf("  Multi-RTSP + MPP + RKNN Performance Benchmark\n");
+    printf("========================================================\n");
+    printf("  Channels: %d  |  Duration: %ds\n", num_channels, duration_sec);
+    printf("  Model:    %s\n", MODEL_PATH);
+    printf("  BOX_THRESH: %.2f  NMS_THRESH: %.2f\n", BOX_THRESH, NMS_THRESH);
+    printf("========================================================\n\n");
+    
+    signal(SIGINT, [](int){ g_bench_running = false; });
+    g_bench_running = true;
+    
+    // Init RKNN instances
+    rknn_core_mask core_masks[] = { RKNN_NPU_CORE_0, RKNN_NPU_CORE_1, RKNN_NPU_CORE_2 };
+    RKNNInference rknn[MAX_CHANNELS];
+    for (int i = 0; i < num_channels; i++) {
+        rknn_core_mask core = core_masks[i % 3];
+        if (!rknn[i].init(std::string(MODEL_PATH), core)) {
+            printf("[FATAL] RKNN#%d init failed\n", i); return 1;
+        }
+        printf("[RKNN#%d] Initialized, core=%d, outputs=3\n", i, (int)core);
+    }
+    
+    // Init stats
+    ChannelStats stats[MAX_CHANNELS];
+    for (int i = 0; i < num_channels; i++) {
+        stats[i].channel_id = i;
+        stats[i].core_mask = core_masks[i % 3];
+        g_stats[i] = &stats[i];
+    }
+    
+    // Launch channel threads
+    std::vector<std::thread> threads;
+    for (int i = 0; i < num_channels; i++)
+        threads.emplace_back(channel_loop, i, DEFAULT_RTSP_URLS[i], &rknn[i], duration_sec);
+    
+    // Live stats every 5 seconds
+    int64_t start_time = get_time_ms();
+    while (g_bench_running && (get_time_ms() - start_time) < duration_sec * 1000) {
+        int elapsed = (get_time_ms() - start_time) / 1000;
+        if (elapsed > 0 && elapsed % 5 == 0) {
+            int next_report = (elapsed / 5 + 1) * 5;
+            while (g_bench_running && (get_time_ms() - start_time) / 1000 < next_report && (get_time_ms() - start_time) < duration_sec * 1000)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (!g_bench_running) break;
+            int sec = (get_time_ms() - start_time) / 1000;
+            printf("\n--- [%ds] Live Stats ---\n", sec);
+            for (int i = 0; i < num_channels; i++) {
+                double fps = sec > 0 ? (double)stats[i].infer_count / sec : 0;
+                printf("  CH%d: %d frames, %.1f fps, avg_infer=%.1fms, detections=%d\n",
+                    i, stats[i].infer_count.load(), fps, stats[i].inferAvg(), stats[i].detect_count.load());
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    
+    g_bench_running = false;
+    for (auto& t : threads) t.join();
+    
+    // Print results
+    int total_sec = duration_sec;
+    int total_infer = 0, total_detect = 0;
+    for (int i = 0; i < num_channels; i++) { total_infer += stats[i].infer_count; total_detect += stats[i].detect_count; }
+    double total_fps = total_sec > 0 ? (double)total_infer / total_sec : 0;
+    
+    printf("\n========================================================\n");
+    printf("  BENCHMARK RESULTS SUMMARY\n");
+    printf("========================================================\n");
+    printf("  Channels: %d  |  Duration: %ds  |  Model: YOLOv5s\n", num_channels, total_sec);
+    printf("  BOX_THRESH: %.2f  |  NMS_THRESH: %.2f\n", BOX_THRESH, NMS_THRESH);
+    printf("========================================================\n\n");
+    
+    printf("Channel | NPU Core | Frames |   FPS  | Avg Infer | P99 Infer | Min Infer | Max Infer | Detections\n");
+    printf("--------|----------|--------|--------|-----------|-----------|-----------|-----------|----------\n");
+    for (int i = 0; i < num_channels; i++) {
+        double fps = total_sec > 0 ? (double)stats[i].infer_count / total_sec : 0;
+        printf("  CH%d   |  Core %d  | %6d | %6.1f |  %6.2fms |  %6.2fms |  %6.2fms |  %6.2fms | %8d\n",
+            i, (int)stats[i].core_mask, stats[i].infer_count.load(), fps,
+            stats[i].inferAvg(), stats[i].inferP99(), stats[i].inferMin(), stats[i].inferMax(),
+            stats[i].detect_count.load());
+    }
+    printf("--------|----------|--------|--------|-----------|-----------|-----------|-----------|----------\n");
+    printf("  TOTAL |    -     | %6d | %6.1f |     -     |     -     |     -     |     -     | %8d\n", total_infer, total_detect);
+    
+    // NPU load
+    printf("\n--- NPU Load ---\n");
+    FILE* npu_fp = fopen("/sys/kernel/debug/rknpu/load", "r");
+    if (npu_fp) { char buf[256]; while (fgets(buf, sizeof(buf), npu_fp)) printf("  %s", buf); fclose(npu_fp); }
+    
+    // CSV export
+    char csv_name[128];
+    snprintf(csv_name, sizeof(csv_name), "benchmark_%dch_%ds.csv", num_channels, total_sec);
+    FILE* csv = fopen(csv_name, "w");
+    if (csv) {
+        fprintf(csv, "channel,npu_core,frames,fps,avg_infer_ms,p99_infer_ms,min_infer_ms,max_infer_ms,detections\n");
+        for (int i = 0; i < num_channels; i++) {
+            double fps = total_sec > 0 ? (double)stats[i].infer_count / total_sec : 0;
+            fprintf(csv, "%d,%d,%d,%.1f,%.2f,%.2f,%.2f,%.2f,%d\n",
+                i, (int)stats[i].core_mask, stats[i].infer_count.load(), fps,
+                stats[i].inferAvg(), stats[i].inferP99(), stats[i].inferMin(), stats[i].inferMax(),
+                stats[i].detect_count.load());
+        }
+        fclose(csv);
+        printf("\nResults saved to: %s\n", csv_name);
+    }
+    
+    printf("\nBenchmark complete.\n");
     return 0;
 }
