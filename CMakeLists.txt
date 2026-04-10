@@ -149,6 +149,10 @@ if(Qt5_FOUND)
             target_link_libraries(multi_rtsp_test PRIVATE ${QT_LIBS} ${COMMON_LIBS} ${FFMPEG_LIBRARIES})
             
             add_executable(multi_rtsp_mpp_test src/qt_ui/multi_rtsp_mpp_test.cpp)
+            # ========== Qt UI Benchmark ==========
+            add_executable(multi_rtsp_benchmark_ui src/qt_ui/multi_rtsp_benchmark_ui.cpp)
+            target_include_directories(multi_rtsp_benchmark_ui PRIVATE ${COMMON_INCLUDES} ${FFMPEG_INCLUDE_DIRS})
+            target_link_libraries(multi_rtsp_benchmark_ui PRIVATE ${QT_LIBS} ${COMMON_LIBS} ${FFMPEG_LIBRARIES})
             target_include_directories(multi_rtsp_mpp_test PRIVATE ${COMMON_INCLUDES} ${FFMPEG_INCLUDE_DIRS})
             target_link_libraries(multi_rtsp_mpp_test PRIVATE ${QT_LIBS} ${COMMON_LIBS} ${FFMPEG_LIBRARIES})
 
