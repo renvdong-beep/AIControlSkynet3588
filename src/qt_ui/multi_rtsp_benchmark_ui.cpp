@@ -594,6 +594,12 @@ public:
         for (int i = 0; i < MAX_CHANNELS; i++)
             rtsp_urls_[i] = DEFAULT_RTSP_URLS[i];
         
+        // Initialize stats pointers before timers
+        for (int i = 0; i < MAX_CHANNELS; i++) {
+            stats_ptr_[i].reset(new ChannelStats());
+            stats_ptr_[i]->channel_id = i;
+        }
+        
         setupUI();
         
         // 显示刷新定时器
@@ -911,7 +917,7 @@ private:
     }
     
     void updateDisplay() {
-        if (!running_) return;
+        if (!running_ && !stats_ptr_[0]) return;
         for (int i = 0; i < num_channels_; i++) {
             std::lock_guard<std::mutex> lock(display_mutex_[i]);
             if (!display_image_[i].isNull()) {
@@ -921,6 +927,7 @@ private:
     }
     
     void updateStats() {
+        if (!stats_ptr_[0]) return;
         if (!running_ && elapsed_sec_ == 0) return;
         
         if (running_) {
